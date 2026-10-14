@@ -92,6 +92,27 @@ class JiraClient:
         url = f"{self.base_url}/rest/api/3/issue/{urllib.parse.quote(key)}?{query}"
         return self._get(url)
 
+    def highest_issue_number(self, project: str) -> int | None:
+        query = urllib.parse.urlencode(
+            {
+                "jql": f"project = {project} ORDER BY key DESC",
+                "maxResults": 1,
+                "fields": "key",
+            }
+        )
+        page = self._get(f"{self.base_url}/rest/api/3/search/jql?{query}")
+        if page is None:
+            raise JiraError(404, f"project {project} was not found")
+        issues = page.get("issues") or []
+        if not isinstance(issues, list) or not issues:
+            return None
+        key = str((issues[0] or {}).get("key") or "")
+        prefix = f"{project}-"
+        number = key[len(prefix):] if key.startswith(prefix) else ""
+        if not number.isdigit():
+            raise JiraError(0, f"unexpected issue key {key}")
+        return int(number)
+
     def get_comments(self, key: str) -> list[dict]:
         comments: list[dict] = []
         start = 0
@@ -709,7 +730,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Extract Jira Cloud issues to markdown files.")
     parser.add_argument("--project", required=True, help="Project key, for example PROJ")
     parser.add_argument("--start", required=True, type=int, help="First issue number, inclusive")
-    parser.add_argument("--end", required=True, type=int, help="Last issue number, inclusive")
+    parser.add_argument("--end", type=int, help="Last issue number, inclusive. Defaults to the highest existing issue.")
     parser.add_argument("--out", default="out/jira", help="Directory for markdown files")
     args = parser.parse_args(argv)
     args.project = args.project.strip().upper()
@@ -717,7 +738,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("PROJECT must be a Jira key such as PROJ")
     if args.start < 1:
         parser.error("START must be 1 or greater")
-    if args.end < args.start:
+    if args.end is not None and args.end < args.start:
         parser.error("END must be greater than or equal to START")
     return args
 
@@ -726,7 +747,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
         client = build_client_from_env()
-        result = extract_range(client, args.project, args.start, args.end, Path(args.out))
+        end = args.end
+        if end is None:
+            end = client.highest_issue_number(args.project)
+            if end is None or end < args.start:
+                print(f"no issues at or above {args.project}-{args.start}", file=sys.stderr)
+                return 0
+            print(f"last issue is {args.project}-{end}", file=sys.stderr)
+        result = extract_range(client, args.project, args.start, end, Path(args.out))
     except JiraAuthError as error:
         print(f"authentication failed: {error}", file=sys.stderr)
         return 1

@@ -16,6 +16,7 @@ from tools.jira import (
     extract_range,
     format_jira_time,
     main,
+    parse_args,
     render_issue,
 )
 
@@ -426,6 +427,30 @@ class ImageTests(unittest.TestCase):
         )
         with self.assertRaises(JiraError):
             client.download_attachment(_attachment("10", "shot.png", "image/png"))
+
+
+class RangeTests(unittest.TestCase):
+    def test_end_is_optional(self):
+        args = parse_args(["--project", "proj", "--start", "5"])
+        self.assertEqual(args.project, "PROJ")
+        self.assertEqual(args.start, 5)
+        self.assertIsNone(args.end)
+
+    def test_highest_issue_number_reads_the_latest_key(self):
+        def transport(url: str) -> tuple[int, dict | None]:
+            parsed = urllib.parse.urlparse(url)
+            self.assertIn("/rest/api/3/search/jql", parsed.path)
+            query = dict(urllib.parse.parse_qsl(parsed.query))
+            self.assertIn("ORDER BY key DESC", query["jql"])
+            self.assertEqual(query["maxResults"], "1")
+            return 200, {"issues": [{"key": "PROJ-120"}]}
+
+        client = JiraClient("https://acme.atlassian.net", transport)
+        self.assertEqual(client.highest_issue_number("PROJ"), 120)
+
+    def test_highest_issue_number_is_empty_when_the_project_has_no_issues(self):
+        client = JiraClient("https://acme.atlassian.net", lambda url: (200, {"issues": []}))
+        self.assertIsNone(client.highest_issue_number("PROJ"))
 
 
 class MainTests(unittest.TestCase):

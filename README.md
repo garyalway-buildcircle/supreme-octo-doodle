@@ -17,10 +17,11 @@ Fill in `JIRA_BASE_URL` (the site root, such as `https://your-site.atlassian.net
 From the repo root:
 
 ```bash
+make jira PROJECT=PROJ START=100
 make jira PROJECT=PROJ START=100 END=120
 ```
 
-`PROJECT` is the issue key prefix. `START` and `END` are inclusive issue numbers, so that command fetches `PROJ-100` through `PROJ-120`. Each existing ticket is written to `out/jira/PROJ-100.md`. Missing numbers are skipped. Images from the description and comments are saved beside it, for example `out/jira/PROJ-100/screenshot.png`, and the markdown links to those files.
+`PROJECT` is the issue key prefix. `START` is the first issue number. Without `END`, the export runs through the highest existing issue in the project. With `END`, that number is the last issue, inclusive, so the second command fetches `PROJ-100` through `PROJ-120`. Each existing ticket is written to `out/jira/PROJ-100.md`. Missing numbers are skipped. Images from the description and comments are saved beside it, for example `out/jira/PROJ-100/screenshot.png`, and the markdown links to those files.
 
 `make` on its own prints that same usage line.
 
