@@ -1,0 +1,9 @@
+[tool.ruff]
+target-version = "py39"
+line-length = 88
+
+[tool.ruff.lint]
+# FLY002 wants multi-line test fixtures collapsed into one string.
+# UP006 and UP035 want tuple[] instead of Tuple[]. Those aliases are
+# evaluated at import time, and Python 3.9 rejects tuple[int, dict | None] there.
+ignore = ["FLY002", "UP006", "UP035"]
