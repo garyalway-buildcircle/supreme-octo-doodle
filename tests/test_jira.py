@@ -11,6 +11,8 @@ from tools.jira import (
     JiraAuthError,
     JiraClient,
     JiraError,
+    _attachment_content_url,
+    _same_host,
     extract_range,
     format_jira_time,
     main,
@@ -281,7 +283,7 @@ class ImageTests(unittest.TestCase):
             self.assertIn("[shot.png]", text)
             self.assertFalse((Path(directory) / "PROJ-1").exists())
 
-    def test_auth_failure_on_image_stops_the_range(self):
+    def test_auth_failure_on_one_image_keeps_the_rest_of_the_range(self):
         issue = _issue("PROJ-1")
         issue["fields"]["description"] = {"type": "doc", "content": [_media("shot.png", "media-shot")]}
         issue["fields"]["attachment"] = [_attachment("10", "shot.png", "image/png")]
@@ -292,22 +294,107 @@ class ImageTests(unittest.TestCase):
             requested.append(parsed.path)
             if parsed.path.endswith("/comment"):
                 return 200, {"startAt": 0, "maxResults": 100, "total": 0, "comments": []}
-            return 200, issue
+            key = parsed.path.rstrip("/").split("/")[-1]
+            payload = _issue(key)
+            payload["fields"]["description"] = issue["fields"]["description"]
+            payload["fields"]["attachment"] = issue["fields"]["attachment"]
+            return 200, payload
 
         def download(url: str) -> tuple[int, bytes]:
             return 401, b""
 
         with TemporaryDirectory() as directory:
-            with self.assertRaises(JiraAuthError):
-                extract_range(
-                    JiraClient("https://acme.atlassian.net", transport, download),
-                    "PROJ",
-                    1,
-                    2,
-                    Path(directory),
-                )
-            self.assertFalse((Path(directory) / "PROJ-1.md").exists())
-            self.assertFalse(any(path.endswith("/PROJ-2") for path in requested))
+            result = extract_range(
+                JiraClient("https://acme.atlassian.net", transport, download),
+                "PROJ",
+                1,
+                2,
+                Path(directory),
+            )
+            self.assertEqual(result.failed, [])
+            self.assertTrue((Path(directory) / "PROJ-1.md").exists())
+            self.assertTrue((Path(directory) / "PROJ-2.md").exists())
+            self.assertIn("[shot.png]", (Path(directory) / "PROJ-1.md").read_text(encoding="utf-8"))
+            self.assertTrue(any(path.endswith("/PROJ-2") for path in requested))
+
+    def test_duplicate_filenames_are_not_guessed(self):
+        downloaded: list[str] = []
+
+        def download(attachment: dict) -> bytes:
+            downloaded.append(str(attachment["id"]))
+            return b"png"
+
+        with TemporaryDirectory() as directory:
+            images = IssueImages(
+                attachments=[
+                    _attachment("10", "shot.png", "image/png"),
+                    _attachment("11", "shot.png", "image/png"),
+                ],
+                download=download,
+                directory=Path(directory) / "PROJ-1",
+                folder_name="PROJ-1",
+                issue_key="PROJ-1",
+            )
+            self.assertIsNone(images(_media("shot.png", "one")))
+            self.assertIsNone(images(_media("shot.png", "two")))
+            self.assertEqual(downloaded, [])
+
+    def test_rendered_html_order_picks_duplicate_filenames(self):
+        issue = _issue("PROJ-1")
+        issue["fields"]["description"] = {
+            "type": "doc",
+            "content": [_media("Left view", "media-left"), _media("Right view", "media-right")],
+        }
+        issue["fields"]["attachment"] = [
+            _attachment("10", "shot.png", "image/png"),
+            _attachment("11", "shot.png", "image/png"),
+        ]
+        issue["renderedFields"] = {
+            "description": (
+                '<img src="https://acme.atlassian.net/rest/api/3/attachment/content/11" alt="shot.png">'
+                '<img src="https://acme.atlassian.net/rest/api/3/attachment/content/10" alt="shot.png">'
+            )
+        }
+        seen: list[str] = []
+
+        def transport(url: str) -> tuple[int, dict | None]:
+            if urllib.parse.urlparse(url).path.endswith("/comment"):
+                return 200, {"startAt": 0, "maxResults": 100, "total": 0, "comments": []}
+            return 200, issue
+
+        def download(url: str) -> tuple[int, bytes]:
+            seen.append(url)
+            if "/content/11?" in url:
+                return 200, b"from-11"
+            if "/content/10?" in url:
+                return 200, b"from-10"
+            raise AssertionError(url)
+
+        with TemporaryDirectory() as directory:
+            result = extract_range(
+                JiraClient("https://acme.atlassian.net", transport, download),
+                "PROJ",
+                1,
+                1,
+                Path(directory),
+            )
+            text = result.wrote[0].read_text(encoding="utf-8")
+            folder = Path(directory) / "PROJ-1"
+            self.assertEqual((folder / "shot.png").read_bytes(), b"from-11")
+            self.assertEqual((folder / "shot-10.png").read_bytes(), b"from-10")
+            self.assertIn("![Left view](PROJ-1/shot.png)", text)
+            self.assertIn("![Right view](PROJ-1/shot-10.png)", text)
+            self.assertEqual(result.failed, [])
+
+    def test_attachment_download_stays_on_the_jira_host(self):
+        attachment = _attachment("10", "shot.png", "image/png")
+        attachment["content"] = "https://evil.example/steal"
+        self.assertEqual(
+            _attachment_content_url("https://acme.atlassian.net", attachment),
+            "https://acme.atlassian.net/rest/api/3/attachment/content/10?redirect=false",
+        )
+        self.assertTrue(_same_host("https://acme.atlassian.net/a", "https://acme.atlassian.net/b"))
+        self.assertFalse(_same_host("https://acme.atlassian.net/a", "https://evil.example/b"))
 
     def test_same_filename_is_reused_for_one_attachment(self):
         downloaded: list[str] = []

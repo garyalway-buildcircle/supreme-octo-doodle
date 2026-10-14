@@ -137,6 +137,7 @@ def _list(node: dict) -> str:
     lines: list[str] = []
     for offset, item in enumerate(_children(node)):
         marker = f"{start + offset}." if ordered else "-"
+        pad = " " * (len(marker) + 1)
         blocks = [
             _render(child).strip("\n")
             for child in _children(item)
@@ -148,13 +149,13 @@ def _list(node: dict) -> str:
         first, *rest = blocks
         if "\n" in first:
             lines.append(marker)
-            lines.extend(_indent(first, "  "))
+            lines.extend(_indent(first, pad))
         else:
             lines.append(f"{marker} {first}")
         for block in rest:
             if not _is_list_block(block):
                 lines.append("")
-            lines.extend(_indent(block, "  "))
+            lines.extend(_indent(block, pad))
     return "\n".join(lines)
 
 
@@ -187,7 +188,7 @@ def _cell_text(node: dict) -> str:
             parts.append(_inlines(_children(child)))
         else:
             parts.append(_render(child).replace("\n", " "))
-    text = " ".join(part.strip() for part in parts if part.strip())
+    text = " ".join(" ".join(parts).split())
     return text.replace("|", "\\|")
 
 
@@ -198,8 +199,8 @@ def _media(node: dict) -> str:
         if rendered:
             return rendered
     attrs = node.get("attrs") or {}
-    name = attrs.get("alt") or attrs.get("id") or "attachment"
-    return f"[{name}]"
+    name = " ".join(str(attrs.get("alt") or attrs.get("id") or "attachment").split())
+    return f"[{_escape(name) or 'attachment'}]"
 
 
 def _expand(node: dict) -> str:

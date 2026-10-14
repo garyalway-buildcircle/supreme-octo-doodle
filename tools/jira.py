@@ -22,6 +22,23 @@ from tools.adf import adf_to_markdown
 Transport = Callable[[str], Tuple[int, Optional[dict]]]
 Download = Callable[[str], Tuple[int, bytes]]
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".svg"}
+_NON_IMAGE_SUFFIXES = {
+    ".pdf",
+    ".zip",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".txt",
+    ".csv",
+    ".json",
+    ".xml",
+}
+_IMG_TAG = re.compile(r"<img\b([^>]*)>", re.IGNORECASE)
+_HTML_ATTR = re.compile(r"""([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
+_ATTACHMENT_CONTENT_ID = re.compile(r"/attachment/content/(\d+)")
 
 _PROJECT_KEY = re.compile(r"^[A-Z][A-Z0-9]{1,31}$")
 _TIME = re.compile(
@@ -68,6 +85,7 @@ class JiraClient:
         query = urllib.parse.urlencode(
             {
                 "fields": "summary,description,status,assignee,issuelinks,attachment",
+                "expand": "renderedFields",
                 "updateHistory": "false",
             }
         )
@@ -83,6 +101,7 @@ class JiraClient:
                     "startAt": start,
                     "maxResults": 100,
                     "orderBy": "created",
+                    "expand": "renderedBody",
                 }
             )
             url = (
@@ -146,37 +165,41 @@ class _CaptureRedirect(urllib.request.HTTPRedirectHandler):
             fp.close()
         raise _Redirect(newurl)
 
+    http_error_308 = urllib.request.HTTPRedirectHandler.http_error_302
+
+
+def _request_with_retries(opener, url: str, auth: str, timeout: float, accept: str, attempts: int):
+    delay = 1.0
+    last_error: JiraError | None = None
+    for attempt in range(attempts):
+        try:
+            return _read_download(opener, url, auth, timeout, accept)
+        except urllib.error.HTTPError as error:
+            payload = error.read()
+            if error.code == 429 and attempt + 1 < attempts:
+                time.sleep(_retry_seconds(error.headers.get("Retry-After"), delay))
+                delay = min(delay * 2, 30)
+                continue
+            return error.code, payload
+        except urllib.error.URLError as error:
+            last_error = JiraError(0, str(error.reason))
+            if attempt + 1 < attempts:
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+                continue
+        except JiraError as error:
+            last_error = error
+            break
+    raise last_error or JiraError(0, "request failed")
+
 
 def urllib_transport(email: str, token: str, timeout: float = 30.0, attempts: int = 5) -> Transport:
     auth = base64.b64encode(f"{email}:{token}".encode()).decode("ascii")
-    headers = {
-        "Authorization": f"Basic {auth}",
-        "Accept": "application/json",
-        "User-Agent": "supreme-octo-doodle",
-    }
+    opener = urllib.request.build_opener(_CaptureRedirect)
 
     def transport(url: str) -> tuple[int, dict | None]:
-        delay = 1.0
-        last_error: JiraError | None = None
-        for attempt in range(attempts):
-            request = urllib.request.Request(url, headers=headers)
-            try:
-                with urllib.request.urlopen(request, timeout=timeout) as response:
-                    return response.status, _parse_json(response.read())
-            except urllib.error.HTTPError as error:
-                payload = _parse_json(error.read())
-                if error.code == 429 and attempt + 1 < attempts:
-                    time.sleep(_retry_seconds(error.headers.get("Retry-After"), delay))
-                    delay = min(delay * 2, 30)
-                    continue
-                return error.code, payload
-            except urllib.error.URLError as error:
-                last_error = JiraError(0, str(error.reason))
-                if attempt + 1 < attempts:
-                    time.sleep(delay)
-                    delay = min(delay * 2, 30)
-                    continue
-        raise last_error or JiraError(0, "request failed")
+        status, body = _request_with_retries(opener, url, auth, timeout, "application/json", attempts)
+        return status, _parse_json(body)
 
     return transport
 
@@ -186,37 +209,16 @@ def urllib_download(email: str, token: str, timeout: float = 60.0, attempts: int
     opener = urllib.request.build_opener(_CaptureRedirect)
 
     def download(url: str) -> tuple[int, bytes]:
-        delay = 1.0
-        last_error: JiraError | None = None
-        for attempt in range(attempts):
-            try:
-                return _read_download(opener, url, auth, timeout)
-            except urllib.error.HTTPError as error:
-                error.read()
-                if error.code == 429 and attempt + 1 < attempts:
-                    time.sleep(_retry_seconds(error.headers.get("Retry-After"), delay))
-                    delay = min(delay * 2, 30)
-                    continue
-                return error.code, b""
-            except urllib.error.URLError as error:
-                last_error = JiraError(0, str(error.reason))
-                if attempt + 1 < attempts:
-                    time.sleep(delay)
-                    delay = min(delay * 2, 30)
-                    continue
-            except JiraError as error:
-                last_error = error
-                break
-        raise last_error or JiraError(0, "attachment download failed")
+        return _request_with_retries(opener, url, auth, timeout, "*/*", attempts)
 
     return download
 
 
-def _read_download(opener, url: str, auth: str, timeout: float) -> tuple[int, bytes]:
+def _read_download(opener, url: str, auth: str, timeout: float, accept: str) -> tuple[int, bytes]:
     current = url
     send_auth = True
     for _hop in range(5):
-        headers = {"Accept": "*/*", "User-Agent": "supreme-octo-doodle"}
+        headers = {"Accept": accept, "User-Agent": "supreme-octo-doodle"}
         if send_auth:
             headers["Authorization"] = f"Basic {auth}"
         request = urllib.request.Request(current, headers=headers)
@@ -225,10 +227,10 @@ def _read_download(opener, url: str, auth: str, timeout: float) -> tuple[int, by
                 return response.status, response.read()
         except _Redirect as redirect:
             if not redirect.url.startswith("https://"):
-                raise JiraError(0, "attachment redirect was not https") from redirect
-            send_auth = urllib.parse.urlsplit(redirect.url).netloc == urllib.parse.urlsplit(current).netloc
+                raise JiraError(0, "redirect was not https") from redirect
+            send_auth = _same_host(current, redirect.url)
             current = redirect.url
-    raise JiraError(0, "attachment redirect did not finish")
+    raise JiraError(0, "redirect did not finish")
 
 
 def extract_range(
@@ -259,12 +261,22 @@ def extract_range(
             print(f"failed {requested}: {error}", file=sys.stderr)
             continue
         path = out_dir / _markdown_name(key)
+        fields = issue.get("fields") or {}
+        rendered_fields = issue.get("renderedFields") or {}
         images = IssueImages(
-            attachments=(issue.get("fields") or {}).get("attachment"),
+            attachments=fields.get("attachment"),
             download=client.download_attachment,
             directory=out_dir / path.stem,
             folder_name=path.stem,
             issue_key=key,
+            description=fields.get("description"),
+            comments=comments,
+            rendered_description=str(rendered_fields.get("description") or ""),
+            rendered_comments=[
+                str(comment.get("renderedBody") or "")
+                for comment in comments
+                if isinstance(comment, dict)
+            ],
         )
         path.write_text(render_issue(issue, comments, client.base_url, images), encoding="utf-8")
         result.wrote.append(path)
@@ -381,6 +393,13 @@ def format_jira_time(value: str) -> str:
     return f"{match.group('date')} {match.group('time')}"
 
 
+class _RenderedImage:
+    def __init__(self, attachment_id: str, media_id: str):
+        self.attachment_id = attachment_id
+        self.media_id = media_id
+        self.used = False
+
+
 class IssueImages:
     def __init__(
         self,
@@ -389,6 +408,10 @@ class IssueImages:
         directory: Path,
         folder_name: str,
         issue_key: str,
+        description: object = None,
+        comments: list | None = None,
+        rendered_description: str = "",
+        rendered_comments: list | None = None,
     ):
         self._download = download
         self._directory = directory
@@ -406,47 +429,99 @@ class IssueImages:
             name = _filename_key(str(item.get("filename") or ""))
             if name:
                 self._by_name.setdefault(name, []).append(item)
-        self._bound: dict[str, dict] = {}
+        self._by_node: dict[int, dict] = {}
         self._saved: dict[str, str] = {}
         self._used_names: set[str] = set()
-        self._name_cursor: dict[str, int] = {}
+        self._warned: set[int] = set()
+        self._bind_nodes(description, comments or [], rendered_description, rendered_comments or [])
 
     def __call__(self, node: dict) -> str | None:
-        attrs = node.get("attrs") or {}
-        if str(attrs.get("type") or "") == "external":
+        if not _is_embedded_image(node):
             return None
-        attachment = self._match(attrs)
+        attachment = self._match(node)
         if attachment is None:
+            self._warn_unmatched(node)
             return None
         relative = self._save(attachment)
         if not relative:
             return None
+        attrs = node.get("attrs") or {}
         alt = str(attrs.get("alt") or attachment.get("filename") or "image")
         label = _single_line(alt) or "image"
         return f"![{label}]({relative})"
 
-    def _match(self, attrs: dict) -> dict | None:
-        media_id = str(attrs.get("id") or "")
-        if media_id and media_id in self._bound:
-            return self._bound[media_id]
-        chosen = None
+    def _bind_nodes(self, description: object, comments: list, rendered_description: str, rendered_comments: list) -> None:
+        nodes = [node for node in _iter_media(description) if _is_embedded_image(node)]
+        for comment in comments:
+            if isinstance(comment, dict):
+                nodes.extend(node for node in _iter_media(comment.get("body")) if _is_embedded_image(node))
+        rendered: list[_RenderedImage] = []
+        rendered.extend(_rendered_images(rendered_description))
+        for html in rendered_comments:
+            rendered.extend(_rendered_images(str(html or "")))
+        unbound: list[dict] = []
+        for node in nodes:
+            media_id = str((node.get("attrs") or {}).get("id") or "")
+            image = _unused_rendered(rendered, media_id) if media_id else None
+            attachment = self._attachment_for_image(image) if image is not None else None
+            if attachment is None and media_id:
+                attachment = self._by_media.get(media_id) or self._by_id.get(media_id)
+                if attachment is not None:
+                    image = _unused_rendered_attachment(rendered, str(attachment.get("id")))
+            if attachment is None:
+                unbound.append(node)
+                continue
+            self._by_node[id(node)] = attachment
+            if image is not None:
+                image.used = True
+        unused = [image for image in rendered if not image.used and self._attachment_for_image(image) is not None]
+        if unbound and len(unbound) == len(unused):
+            for node, image in zip(unbound, unused):
+                attachment = self._attachment_for_image(image)
+                if attachment is None:
+                    continue
+                self._by_node[id(node)] = attachment
+                image.used = True
+            unbound = [node for node in unbound if id(node) not in self._by_node]
+        for node in unbound:
+            attachment = self._unique_named_attachment(node)
+            if attachment is not None:
+                self._by_node[id(node)] = attachment
+
+    def _attachment_for_image(self, image: _RenderedImage) -> dict | None:
+        attachment = self._by_id.get(image.attachment_id)
+        if attachment is not None:
+            return attachment
+        if image.media_id:
+            return self._by_media.get(image.media_id)
+        return None
+
+    def _match(self, node: dict) -> dict | None:
+        bound = self._by_node.get(id(node))
+        if bound is not None:
+            return bound
+        media_id = str((node.get("attrs") or {}).get("id") or "")
         if media_id and media_id in self._by_media:
-            chosen = self._by_media[media_id]
-        elif media_id and media_id in self._by_id:
-            chosen = self._by_id[media_id]
-        else:
-            name = _filename_key(str(attrs.get("alt") or attrs.get("filename") or ""))
-            queue = self._by_name.get(name) or []
-            if queue:
-                index = self._name_cursor.get(name, 0)
-                if index >= len(queue):
-                    chosen = queue[-1]
-                else:
-                    chosen = queue[index]
-                    self._name_cursor[name] = index + 1
-        if chosen is not None and media_id:
-            self._bound[media_id] = chosen
-        return chosen
+            return self._by_media[media_id]
+        if media_id and media_id in self._by_id:
+            return self._by_id[media_id]
+        return self._unique_named_attachment(node)
+
+    def _unique_named_attachment(self, node: dict) -> dict | None:
+        attrs = node.get("attrs") or {}
+        name = _filename_key(str(attrs.get("alt") or attrs.get("filename") or ""))
+        matches = self._by_name.get(name) or []
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def _warn_unmatched(self, node: dict) -> None:
+        if id(node) in self._warned:
+            return
+        self._warned.add(id(node))
+        attrs = node.get("attrs") or {}
+        name = attrs.get("alt") or attrs.get("id") or "image"
+        print(f"failed image {self._issue_key} {name}: no matching attachment", file=sys.stderr)
 
     def _save(self, attachment: dict) -> str | None:
         attachment_id = str(attachment.get("id"))
@@ -456,8 +531,6 @@ class IssueImages:
         filename = str(attachment.get("filename") or attachment_id)
         try:
             data = self._download(attachment)
-        except JiraAuthError:
-            raise
         except JiraError as error:
             print(f"failed image {self._issue_key} {filename}: {error}", file=sys.stderr)
             return None
@@ -490,6 +563,63 @@ class IssueImages:
             number += 1
 
 
+def _iter_media(node: object):
+    if not isinstance(node, dict):
+        return
+    if node.get("type") == "media":
+        yield node
+    for child in node.get("content") or []:
+        yield from _iter_media(child)
+
+
+def _is_embedded_image(node: dict) -> bool:
+    if node.get("type") != "media":
+        return False
+    attrs = node.get("attrs") or {}
+    if str(attrs.get("type") or "") == "external":
+        return False
+    name = str(attrs.get("alt") or attrs.get("filename") or "")
+    suffix = Path(name).suffix.lower()
+    if suffix in _NON_IMAGE_SUFFIXES:
+        return False
+    return suffix in _IMAGE_SUFFIXES or not suffix
+
+
+def _rendered_images(html: str) -> list[_RenderedImage]:
+    images: list[_RenderedImage] = []
+    for match in _IMG_TAG.finditer(html or ""):
+        attrs: dict[str, str] = {}
+        for found in _HTML_ATTR.finditer(match.group(1)):
+            value = found.group(2) if found.group(2) is not None else found.group(3)
+            attrs[found.group(1).lower()] = value or ""
+        src = (attrs.get("src") or "").replace("&amp;", "&")
+        content = _ATTACHMENT_CONTENT_ID.search(src)
+        if not content:
+            continue
+        media_id = (
+            attrs.get("data-media-services-id")
+            or attrs.get("data-media-id")
+            or attrs.get("data-file-id")
+            or ""
+        )
+        images.append(_RenderedImage(content.group(1), media_id))
+    return images
+
+
+def _unused_rendered(rendered: list[_RenderedImage], media_id: str) -> _RenderedImage | None:
+    for image in rendered:
+        if not image.used and image.media_id == media_id:
+            return image
+    return None
+
+
+def _unused_rendered_attachment(rendered: list[_RenderedImage], attachment_id: str) -> _RenderedImage | None:
+    for image in rendered:
+        if not image.used and image.attachment_id == attachment_id:
+            return image
+    return None
+
+
 def _is_image(attachment: dict) -> bool:
     mime = str(attachment.get("mimeType") or "").split(";", 1)[0].strip().lower()
     if mime.startswith("image/"):
@@ -506,14 +636,18 @@ def _safe_filename(name: str) -> str:
     return cleaned
 
 
+def _same_host(left: str, right: str) -> bool:
+    return urllib.parse.urlsplit(left).netloc.lower() == urllib.parse.urlsplit(right).netloc.lower()
+
+
 def _attachment_content_url(base_url: str, attachment: dict) -> str:
     content = str(attachment.get("content") or "")
-    if content.startswith("https://"):
+    if content.startswith("https://") and _same_host(base_url, content):
         parts = urllib.parse.urlsplit(content)
         query = dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
         query["redirect"] = "false"
         return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(query), ""))
-    attachment_id = urllib.parse.quote(str(attachment.get("id") or ""))
+    attachment_id = urllib.parse.quote(str(attachment.get("id") or ""), safe="")
     return f"{base_url}/rest/api/3/attachment/content/{attachment_id}?redirect=false"
 
 
