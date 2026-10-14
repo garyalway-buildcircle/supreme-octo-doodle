@@ -456,6 +456,8 @@ class IssueImages:
         filename = str(attachment.get("filename") or attachment_id)
         try:
             data = self._download(attachment)
+        except JiraAuthError:
+            raise
         except JiraError as error:
             print(f"failed image {self._issue_key} {filename}: {error}", file=sys.stderr)
             return None

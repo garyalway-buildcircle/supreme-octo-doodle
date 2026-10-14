@@ -281,6 +281,34 @@ class ImageTests(unittest.TestCase):
             self.assertIn("[shot.png]", text)
             self.assertFalse((Path(directory) / "PROJ-1").exists())
 
+    def test_auth_failure_on_image_stops_the_range(self):
+        issue = _issue("PROJ-1")
+        issue["fields"]["description"] = {"type": "doc", "content": [_media("shot.png", "media-shot")]}
+        issue["fields"]["attachment"] = [_attachment("10", "shot.png", "image/png")]
+        requested: list[str] = []
+
+        def transport(url: str) -> tuple[int, dict | None]:
+            parsed = urllib.parse.urlparse(url)
+            requested.append(parsed.path)
+            if parsed.path.endswith("/comment"):
+                return 200, {"startAt": 0, "maxResults": 100, "total": 0, "comments": []}
+            return 200, issue
+
+        def download(url: str) -> tuple[int, bytes]:
+            return 401, b""
+
+        with TemporaryDirectory() as directory:
+            with self.assertRaises(JiraAuthError):
+                extract_range(
+                    JiraClient("https://acme.atlassian.net", transport, download),
+                    "PROJ",
+                    1,
+                    2,
+                    Path(directory),
+                )
+            self.assertFalse((Path(directory) / "PROJ-1.md").exists())
+            self.assertFalse(any(path.endswith("/PROJ-2") for path in requested))
+
     def test_same_filename_is_reused_for_one_attachment(self):
         downloaded: list[str] = []
 
