@@ -58,3 +58,18 @@ Rewrites links in the exported markdown so they point at local files when those 
 ```bash
 make links
 ```
+
+## Git
+
+Writes one markdown file per GitHub repository: URL, default branch, commit, commit date, subject, README, languages, top-level layout, project files, and C4 container diagrams for Terraform and AWS CDK. Language counts and the layout skip dependency directories such as `node_modules`, `.terraform`, and `cdk.out`.
+
+A read-only personal access token is enough for a private repository. Public repositories need no token. Create a token with Contents read at <https://github.com/settings/personal-access-tokens>, then add `GIT_TOKEN` to `.env`. A `$` in a token must be written as `$$` because Make reads `.env`.
+
+```bash
+make git URL=https://github.com/org/name
+make git REPOS=repos.txt
+```
+
+`URL` is one repository. `REPOS` is a text file with one repository URL per line. Blank lines and lines starting with `#` are ignored. Pass one of them, not both. `https://github.com/org/name` and `git@github.com:org/name.git` are accepted. Other hosts are not. Each repository is written to `out/git/org-name.md`. The clone is shallow, of the default branch, and is removed after the file is written.
+
+Recognized compute, storage, database, queue, and network resources become containers in a Mermaid C4 diagram. An edge means one of them references another. Argument values and `.tfvars` files are not copied. A supporting resource that points at two of them, such as an event source mapping, becomes an edge and is not itself a container. IAM roles, security groups, and other supporting resources are omitted. A directory of `.tf` files that no other file calls as a module is a Terraform root, and a local module is drawn inside the root that calls it. A remote module is one container. A directory containing `cdk.json` is a CDK app. That diagram reads TypeScript and Python, and skips tests.
