@@ -223,8 +223,18 @@ def clone_repository(url: str, dest: Path, token: str | None) -> Checkout:
 
 
 def summarize(root: Path, meta: RepoMeta) -> str:
+    text, _diagrams = _summary(root, meta)
+    return text
+
+
+def _summary(root: Path, meta: RepoMeta) -> tuple[str, list[tuple[str, str]]]:
     layout = _layout(root)
     layout_block = layout if layout == "_Empty._" else f"```\n{layout}\n```"
+    terraform = terraform_diagrams(root)
+    cdk = cdk_diagrams(root)
+    stem = f"{meta.owner}-{meta.name}"
+    terraform_links, terraform_files = _diagram_links(stem, "terraform", terraform)
+    cdk_links, cdk_files = _diagram_links(stem, "cdk", cdk)
     parts = [
         f"# {meta.owner}/{meta.name}",
         "",
@@ -250,12 +260,12 @@ def summarize(root: Path, meta: RepoMeta) -> str:
         "",
         _project_files(root),
         "",
-        _diagram_section("Terraform", terraform_diagrams(root), "_No Terraform roots._"),
+        _diagram_section("Terraform", terraform, "_No Terraform roots._", terraform_links),
         "",
-        _diagram_section("CDK", cdk_diagrams(root), "_No CDK apps._"),
+        _diagram_section("CDK", cdk, "_No CDK apps._", cdk_links),
         "",
     ]
-    return "\n".join(parts)
+    return "\n".join(parts), terraform_files + cdk_files
 
 
 def extract_repositories(
@@ -282,7 +292,7 @@ def extract_repositories(
             with TemporaryDirectory() as tmp:
                 dest = Path(tmp) / "repo"
                 checkout = clone(repository.clone_url, dest, token)
-                text = summarize(
+                text, diagrams = _summary(
                     dest,
                     RepoMeta(
                         url=repository.page_url,
@@ -295,6 +305,10 @@ def extract_repositories(
                     ),
                 )
             path = out_dir / f"{repository.owner}-{repository.name}.md"
+            for relative, body in diagrams:
+                diagram_path = out_dir / relative
+                diagram_path.parent.mkdir(parents=True, exist_ok=True)
+                diagram_path.write_text(body, encoding="utf-8")
             path.write_text(text, encoding="utf-8")
         except (GitError, OSError) as error:
             _fail(result, repository.page_url, error, token)
@@ -407,15 +421,22 @@ def _redact(text: str, token: str | None) -> str:
     return " ".join(text.split())
 
 
-def _diagram_section(heading: str, diagrams: list[Diagram], empty: str) -> str:
+def _diagram_section(
+    heading: str,
+    diagrams: list[Diagram],
+    empty: str,
+    links: dict[int, tuple[str, str]],
+) -> str:
     if not diagrams:
         return f"## {heading}\n\n{empty}"
     parts = [f"## {heading}"]
-    parts.extend(_one_diagram(diagram) for diagram in diagrams)
+    parts.extend(
+        _one_diagram(diagram, links.get(index)) for index, diagram in enumerate(diagrams)
+    )
     return "\n\n".join(parts)
 
 
-def _one_diagram(diagram: Diagram) -> str:
+def _one_diagram(diagram: Diagram, link: tuple[str, str] | None) -> str:
     lines = [f"### {diagram.title}", ""]
     if diagram.detail:
         lines.append(f"- **App:** {_inline(diagram.detail)}")
@@ -425,13 +446,51 @@ def _one_diagram(diagram: Diagram) -> str:
         if len(diagram.files) > 30:
             files += ", ..."
         lines.append(f"- **Files:** {files}")
-    if len(lines) > 2:
-        lines.append("")
-    if diagram.mermaid:
-        lines.append(f"```mermaid\n{diagram.mermaid}\n```")
-    else:
+    if link:
+        filename, relative = link
+        lines.append(f"- **Diagram:** [{filename}]({relative})")
+    if not diagram.mermaid:
+        if len(lines) > 2:
+            lines.append("")
         lines.append(diagram.note)
     return "\n".join(lines)
+
+
+def _diagram_links(
+    stem: str,
+    kind: str,
+    diagrams: list[Diagram],
+) -> tuple[dict[int, tuple[str, str]], list[tuple[str, str]]]:
+    links: dict[int, tuple[str, str]] = {}
+    files: list[tuple[str, str]] = []
+    used: set[str] = set()
+    for index, diagram in enumerate(diagrams):
+        if not diagram.mermaid:
+            continue
+        filename = _unique_diagram_name(kind, _diagram_slug(diagram.title), used)
+        relative = f"{stem}/{filename}"
+        links[index] = (filename, relative)
+        body = diagram.mermaid if diagram.mermaid.endswith("\n") else f"{diagram.mermaid}\n"
+        files.append((relative, body))
+    return links, files
+
+
+def _diagram_slug(title: str) -> str:
+    slug = title.replace("\\", "/").strip("/")
+    if slug in {"", "."}:
+        return "root"
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", slug.replace("/", "-")).strip(".-")
+    return slug or "root"
+
+
+def _unique_diagram_name(kind: str, slug: str, used: set[str]) -> str:
+    filename = f"{kind}-{slug}.mmd"
+    number = 2
+    while filename in used:
+        filename = f"{kind}-{slug}-{number}.mmd"
+        number += 1
+    used.add(filename)
+    return filename
 
 
 def _readme(root: Path) -> str:

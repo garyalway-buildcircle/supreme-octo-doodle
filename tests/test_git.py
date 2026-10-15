@@ -253,6 +253,44 @@ class ExtractTests(unittest.TestCase):
         self.assertIn("- **URL:** https://github.com/acme/widgets\n", text)
         self.assertNotIn("super-secret", text)
         self.assertNotIn(".git", text.splitlines()[2])
+        self.assertNotIn("```mermaid", text)
+
+    def test_each_diagram_is_a_raw_mermaid_file(self):
+        def clone(url: str, dest: Path, token: str | None) -> Checkout:
+            dest.mkdir()
+            infra = dest / "infra"
+            infra.mkdir()
+            (infra / "main.tf").write_text(
+                'resource "aws_s3_bucket" "logs" {}\n',
+                encoding="utf-8",
+            )
+            (dest / "cdk.json").write_text('{"app": "python app.py"}\n', encoding="utf-8")
+            (dest / "app.py").write_text(
+                'bucket = s3.Bucket(self, "Uploads")\n',
+                encoding="utf-8",
+            )
+            return _checkout()
+
+        with TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            extract_repositories(["https://github.com/acme/widgets"], out, None, clone)
+            text = (out / "acme-widgets.md").read_text(encoding="utf-8")
+            terraform = (out / "acme-widgets" / "terraform-infra.mmd").read_text(encoding="utf-8")
+            cdk = (out / "acme-widgets" / "cdk-root.mmd").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "- **Diagram:** [terraform-infra.mmd](acme-widgets/terraform-infra.mmd)",
+            text,
+        )
+        self.assertIn("- **Diagram:** [cdk-root.mmd](acme-widgets/cdk-root.mmd)", text)
+        self.assertNotIn("```mermaid", text)
+        self.assertNotIn("C4Container", text)
+        self.assertTrue(terraform.startswith("C4Container\n"))
+        self.assertIn('Container(logs, "logs", "Amazon S3", "aws_s3_bucket")', terraform)
+        self.assertTrue(cdk.startswith("C4Container\n"))
+        self.assertIn('Container(Uploads, "Uploads", "Amazon S3", "s3.Bucket")', cdk)
+        self.assertNotIn("```", terraform)
+        self.assertNotIn("```", cdk)
 
     def test_clone_failure_is_recorded(self):
         def clone(url: str, dest: Path, token: str | None) -> Checkout:
