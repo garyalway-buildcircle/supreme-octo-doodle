@@ -15,6 +15,7 @@ _PAGE_FILE = re.compile(r"^\d+\.md$")
 _ISSUE_KEY = re.compile(r"^[A-Z][A-Z0-9]{1,31}-\d+$")
 _URL_LINE = re.compile(r"^- \*\*URL:\*\* (https://\S+)", re.MULTILINE)
 _PAGE_PATH = re.compile(r"/pages/(\d+)(?=/|$)")
+_EDIT_PAGE_PATH = re.compile(r"/pages/edit-v2/(\d+)(?=/|$)")
 _ISSUE_PATH = re.compile(
     r"/(?:browse|issues)/([A-Z][A-Z0-9]{1,31}-\d+)(?=/|$)",
     re.IGNORECASE,
@@ -120,7 +121,7 @@ def _local_target(
 
 
 def _page_id(parts: urllib.parse.SplitResult) -> str | None:
-    match = _PAGE_PATH.search(parts.path)
+    match = _EDIT_PAGE_PATH.search(parts.path) or _PAGE_PATH.search(parts.path)
     if match:
         return match.group(1)
     for value in urllib.parse.parse_qs(parts.query).get("pageId", []):

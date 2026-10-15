@@ -36,7 +36,7 @@ class RewriteTests(unittest.TestCase):
                 (jira / "PROJ-1" / "notes.md").read_text(encoding="utf-8"),
                 "[PROJ-2](https://acme.atlassian.net/browse/PROJ-2)\n",
             )
-            self.assertEqual(result.links, 11)
+            self.assertEqual(result.links, 13)
             self.assertEqual(len(result.files), 4)
 
             again = rewrite_dump(jira, confluence)
@@ -203,6 +203,8 @@ Board [card](https://acme.atlassian.net/jira/software/projects/PROJ/issues/PROJ-
 [a\\]b](https://acme.atlassian.net/browse/PROJ-2)
 
 [angled](<https://acme.atlassian.net/browse/PROJ-2>)
+
+[draft](https://acme.atlassian.net/wiki/spaces/TEAM/pages/edit-v2/42?draftShareId=abc)
 """
 
 _PROJ_1_LINKED = """\
@@ -237,6 +239,8 @@ Board [card](PROJ-2.md).
 [a\\]b](PROJ-2.md)
 
 [angled](PROJ-2.md)
+
+[draft](../confluence/42.md)
 """
 
 _PROJ_2 = """\
@@ -266,6 +270,10 @@ _PAGE_42 = """\
 [section](https://acme.atlassian.net/wiki/spaces/TEAM/pages/42/Notes#Licensing)
 
 [missing](https://acme.atlassian.net/wiki/spaces/TEAM/pages/99/Nope)
+
+[home draft](https://acme.atlassian.net/wiki/spaces/TEAM/pages/edit-v2/7)
+
+[other draft](https://acme.atlassian.net/wiki/spaces/TEAM/pages/edit-v2/99)
 """
 
 _PAGE_42_LINKED = """\
@@ -279,6 +287,10 @@ _PAGE_42_LINKED = """\
 [section](42.md#Licensing)
 
 [missing](https://acme.atlassian.net/wiki/spaces/TEAM/pages/99/Nope)
+
+[home draft](7.md)
+
+[other draft](https://acme.atlassian.net/wiki/spaces/TEAM/pages/edit-v2/99)
 """
 
 _PAGE_7 = """\

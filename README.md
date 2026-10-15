@@ -51,9 +51,9 @@ A parent that is also in the export is linked by its page id, for example `[Pare
 
 ## Links
 
-Rewrites links in the exported markdown so they point at local files when those files exist. A link to another Jira issue becomes `PROJ-102.md` from a Jira file, or `../jira/PROJ-102.md` from a Confluence file. A link to a Confluence page becomes `42.md` or `../confluence/42.md`. The **URL** line on each file stays the remote address. Links to issues or pages that were not exported stay remote, as do links to a different site. Recognized addresses are `/browse/KEY`, `/issues/KEY`, `selectedIssue=KEY`, `/pages/ID`, and `pageId=ID`. A heading fragment on a page link is kept, for example `42.md#Licensing`.
+Rewrites links in the exported markdown so they point at local files when those files exist. A link to another Jira issue becomes `PROJ-102.md` from a Jira file, or `../jira/PROJ-102.md` from a Confluence file. A link to a Confluence page becomes `42.md` or `../confluence/42.md`. The **URL** line on each file stays the remote address. Links to issues or pages that were not exported stay remote, as do links to a different site. Recognized addresses are `/browse/KEY`, `/issues/KEY`, `selectedIssue=KEY`, `/pages/ID`, `/pages/edit-v2/ID`, and `pageId=ID`. A heading fragment on a page link is kept, for example `42.md#Licensing`.
 
-`make jira` and `make confluence` run this after the export. To connect an existing dump:
+`make jira` and `make confluence` run this after the export succeeds. To connect an existing dump:
 
 ```bash
 make links
