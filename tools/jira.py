@@ -3,21 +3,22 @@
 from __future__ import annotations
 
 import argparse
-import base64
-import json
 import os
 import re
 import sys
-import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple
 
 from tools.adf import adf_to_markdown
+from tools.atlassian_http import (
+    TransportError,
+    bytes_download,
+    json_transport,
+    same_host,
+)
 
 Transport = Callable[[str], Tuple[int, Optional[dict]]]
 Download = Callable[[str], Tuple[int, bytes]]
@@ -47,19 +48,8 @@ _TIME = re.compile(
 )
 
 
-class JiraError(Exception):
-    def __init__(self, status: int, detail: str = ""):
-        self.status = status
-        self.detail = detail
-        if detail and not status:
-            message = detail
-        elif detail:
-            message = f"HTTP {status}: {detail[:180]}"
-        elif status:
-            message = f"HTTP {status}"
-        else:
-            message = "request failed"
-        super().__init__(message)
+class JiraError(TransportError):
+    pass
 
 
 class JiraAuthError(JiraError):
@@ -173,85 +163,12 @@ class JiraClient:
         return body
 
 
-class _Redirect(Exception):
-    def __init__(self, url: str):
-        self.url = url
-
-
-class _CaptureRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        try:
-            fp.read()
-        finally:
-            fp.close()
-        raise _Redirect(newurl)
-
-    http_error_308 = urllib.request.HTTPRedirectHandler.http_error_302
-
-
-def _request_with_retries(opener, url: str, auth: str, timeout: float, accept: str, attempts: int):
-    delay = 1.0
-    last_error: JiraError | None = None
-    for attempt in range(attempts):
-        try:
-            return _read_download(opener, url, auth, timeout, accept)
-        except urllib.error.HTTPError as error:
-            payload = error.read()
-            if error.code == 429 and attempt + 1 < attempts:
-                time.sleep(_retry_seconds(error.headers.get("Retry-After"), delay))
-                delay = min(delay * 2, 30)
-                continue
-            return error.code, payload
-        except urllib.error.URLError as error:
-            last_error = JiraError(0, str(error.reason))
-            if attempt + 1 < attempts:
-                time.sleep(delay)
-                delay = min(delay * 2, 30)
-                continue
-        except JiraError as error:
-            last_error = error
-            break
-    raise last_error or JiraError(0, "request failed")
-
-
 def urllib_transport(email: str, token: str, timeout: float = 30.0, attempts: int = 5) -> Transport:
-    auth = base64.b64encode(f"{email}:{token}".encode()).decode("ascii")
-    opener = urllib.request.build_opener(_CaptureRedirect)
-
-    def transport(url: str) -> tuple[int, dict | None]:
-        status, body = _request_with_retries(opener, url, auth, timeout, "application/json", attempts)
-        return status, _parse_json(body)
-
-    return transport
+    return json_transport(email, token, JiraError, timeout, attempts)
 
 
 def urllib_download(email: str, token: str, timeout: float = 60.0, attempts: int = 5) -> Download:
-    auth = base64.b64encode(f"{email}:{token}".encode()).decode("ascii")
-    opener = urllib.request.build_opener(_CaptureRedirect)
-
-    def download(url: str) -> tuple[int, bytes]:
-        return _request_with_retries(opener, url, auth, timeout, "*/*", attempts)
-
-    return download
-
-
-def _read_download(opener, url: str, auth: str, timeout: float, accept: str) -> tuple[int, bytes]:
-    current = url
-    send_auth = True
-    for _hop in range(5):
-        headers = {"Accept": accept, "User-Agent": "supreme-octo-doodle"}
-        if send_auth:
-            headers["Authorization"] = f"Basic {auth}"
-        request = urllib.request.Request(current, headers=headers)
-        try:
-            with opener.open(request, timeout=timeout) as response:
-                return response.status, response.read()
-        except _Redirect as redirect:
-            if not redirect.url.startswith("https://"):
-                raise JiraError(0, "redirect was not https") from redirect
-            send_auth = _same_host(current, redirect.url)
-            current = redirect.url
-    raise JiraError(0, "redirect did not finish")
+    return bytes_download(email, token, JiraError, timeout, attempts)
 
 
 def extract_range(
@@ -658,7 +575,7 @@ def _safe_filename(name: str) -> str:
 
 
 def _same_host(left: str, right: str) -> bool:
-    return urllib.parse.urlsplit(left).netloc.lower() == urllib.parse.urlsplit(right).netloc.lower()
+    return same_host(left, right)
 
 
 def _attachment_content_url(base_url: str, attachment: dict) -> str:
@@ -690,22 +607,6 @@ def _single_line(value: str) -> str:
     for char in ("*", "_", "`", "[", "]"):
         text = text.replace(char, "\\" + char)
     return text
-
-
-def _parse_json(raw: bytes) -> dict | None:
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def _retry_seconds(header: str | None, fallback: float) -> float:
-    if header and header.strip().isdigit():
-        return min(float(header.strip()), 60.0)
-    return fallback
 
 
 def build_client_from_env() -> JiraClient:

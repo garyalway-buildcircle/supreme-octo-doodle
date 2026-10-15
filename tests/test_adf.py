@@ -208,6 +208,86 @@ class AdfToMarkdownTests(unittest.TestCase):
         }
         self.assertEqual(adf_to_markdown(document), "| a b |\n| --- |\n")
 
+    def test_task_list_decision_list_and_inline_image(self):
+        document = {
+            "type": "doc",
+            "content": [
+                {
+                    "type": "taskList",
+                    "content": [
+                        {
+                            "type": "taskItem",
+                            "attrs": {"state": "DONE"},
+                            "content": [{"type": "text", "text": "ship"}],
+                        },
+                        {
+                            "type": "taskItem",
+                            "attrs": {"state": "TODO"},
+                            "content": [{"type": "text", "text": "wait"}],
+                        },
+                    ],
+                },
+                {
+                    "type": "decisionList",
+                    "content": [
+                        {
+                            "type": "decisionItem",
+                            "attrs": {"state": "DECIDED"},
+                            "content": [{"type": "text", "text": "use markdown"}],
+                        }
+                    ],
+                },
+                {
+                    "type": "paragraph",
+                    "content": [
+                        {
+                            "type": "mediaInline",
+                            "attrs": {"type": "file", "id": "file-1", "alt": "shot"},
+                        }
+                    ],
+                },
+            ],
+        }
+        rendered = adf_to_markdown(document, media=lambda node: "![shot](1/shot.png)")
+        self.assertIn("- [x] ship", rendered)
+        self.assertIn("- [ ] wait", rendered)
+        self.assertIn("- **Decision:** use markdown", rendered)
+        self.assertIn("![shot](1/shot.png)", rendered)
+
+    def test_toc_include_and_macro_label(self):
+        document = {
+            "type": "doc",
+            "content": [
+                {"type": "heading", "attrs": {"level": 2}, "content": [{"type": "text", "text": "Intro"}]},
+                {"type": "extension", "attrs": {"extensionKey": "toc"}},
+                {
+                    "type": "bodiedExtension",
+                    "attrs": {
+                        "extensionKey": "note",
+                        "parameters": {"macroParams": {"title": {"value": "Careful"}}},
+                    },
+                    "content": [
+                        {"type": "paragraph", "content": [{"type": "text", "text": "Mind the gap"}]}
+                    ],
+                },
+                {
+                    "type": "extension",
+                    "attrs": {"extensionKey": "include"},
+                },
+            ],
+        }
+
+        def include(node):
+            if (node.get("attrs") or {}).get("extensionKey") == "include":
+                return "Shared page"
+            return None
+
+        rendered = adf_to_markdown(document, include=include)
+        self.assertIn("- Intro", rendered)
+        self.assertIn("**note: Careful**", rendered)
+        self.assertIn("Mind the gap", rendered)
+        self.assertIn("Shared page", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()
