@@ -3,21 +3,23 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import os
 import re
 import sys
-import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple
 
 from tools.adf import adf_to_markdown
+from tools.atlassian_http import (
+    TransportError,
+    bytes_download,
+    json_post,
+    json_transport,
+)
 
 Transport = Callable[[str], Tuple[int, Optional[dict]]]
 Post = Callable[[str, dict], Tuple[int, Optional[dict]]]
@@ -42,22 +44,9 @@ _TIME = re.compile(
     r"^(?P<date>\d{4}-\d{2}-\d{2})T(?P<time>\d{2}:\d{2})"
     r".*?(?P<offset>Z|[+-]\d{2}:?\d{2})?$"
 )
-_RESOLUTION = ("open", "resolved", "reopened", "dangling")
 
-
-class ConfluenceError(Exception):
-    def __init__(self, status: int, detail: str = ""):
-        self.status = status
-        self.detail = detail
-        if detail and not status:
-            message = detail
-        elif detail:
-            message = f"HTTP {status}: {detail[:180]}"
-        elif status:
-            message = f"HTTP {status}"
-        else:
-            message = "request failed"
-        super().__init__(message)
+class ConfluenceError(TransportError):
+    pass
 
 
 class ConfluenceAuthError(ConfluenceError):
@@ -95,19 +84,42 @@ class ConfluenceClient:
         url = self._v2(f"pages/{_quote(page_id)}/descendants", [("limit", "250")])
         return self._paginate(url, f"descendants of {page_id}")
 
-    def get_footer_comments(self, page_id: str) -> list[dict]:
-        url = self._v2(f"pages/{_quote(page_id)}/footer-comments", _comment_query())
-        return self._with_replies(
-            self._paginate(url, f"comments for {page_id}"),
-            "footer-comments",
+    def get_page_comments(self, page_id: str) -> tuple[list[dict], list[dict]]:
+        cql = (
+            f"container = {page_id} AND type = comment AND status = current "
+            "ORDER BY created ASC"
         )
+        query = urllib.parse.urlencode(
+            {
+                "cql": cql,
+                "limit": "100",
+                "expand": (
+                    "body.atlas_doc_format,version,history,ancestors,"
+                    "extensions.inlineProperties,extensions.resolution"
+                ),
+            }
+        )
+        url = f"{self.wiki_root}/rest/api/content/search?{query}"
+        return _comment_threads(self._paginate(url, f"comments for {page_id}"))
 
-    def get_inline_comments(self, page_id: str) -> list[dict]:
-        url = self._v2(f"pages/{_quote(page_id)}/inline-comments", _inline_query())
-        return self._with_replies(
-            self._paginate(url, f"inline comments for {page_id}"),
-            "inline-comments",
-        )
+    def find_page(self, title: str, space: str = "") -> str | None:
+        cql = f'type = page AND title = "{_cql_quote(title)}"'
+        if space:
+            cql += f' AND space = "{_cql_quote(space)}"'
+        query = urllib.parse.urlencode({"cql": cql, "limit": "2"})
+        page = self._get(f"{self.wiki_root}/rest/api/content/search?{query}")
+        if page is None:
+            raise ConfluenceError(404, f"page titled {title} was not found")
+        results = page.get("results")
+        if not isinstance(results, list):
+            raise ConfluenceError(0, f"unexpected search payload for {title}")
+        matches = [item for item in results if isinstance(item, dict)]
+        if len(matches) != 1:
+            return None
+        page_id = str(matches[0].get("id") or "")
+        if not _PAGE_ID.match(page_id):
+            return None
+        return page_id
 
     def get_attachments(self, page_id: str) -> list[dict]:
         url = self._v2(
@@ -131,7 +143,7 @@ class ConfluenceClient:
                 for user in batch:
                     if not isinstance(user, dict) or not user.get("accountId"):
                         continue
-                    name = _single_line(str(user.get("displayName") or ""))
+                    name = " ".join(str(user.get("displayName") or "").split())
                     if name:
                         names[str(user["accountId"])] = name
                 nxt = self._next_link(page)
@@ -157,25 +169,6 @@ class ConfluenceClient:
         if not body:
             raise ConfluenceError(status, f"attachment {filename} was empty")
         return body
-
-    def _with_replies(self, comments: list[dict], kind: str) -> list[dict]:
-        seen: set[str] = set()
-        for comment in comments:
-            comment_id = str(comment.get("id") or "")
-            comment["replies"] = self._replies(comment_id, kind, seen, 1)
-        return comments
-
-    def _replies(self, comment_id: str, kind: str, seen: set[str], depth: int) -> list[dict]:
-        if not comment_id or comment_id in seen:
-            return []
-        if depth > 20:
-            raise ConfluenceError(0, f"comment {comment_id} is nested too deeply")
-        seen.add(comment_id)
-        url = self._v2(f"{kind}/{_quote(comment_id)}/children", _reply_query())
-        replies = self._paginate(url, f"replies for {comment_id}")
-        for reply in replies:
-            reply["replies"] = self._replies(str(reply.get("id") or ""), kind, seen, depth + 1)
-        return replies
 
     def _paginate(self, url: str, label: str) -> list[dict]:
         items: list[dict] = []
@@ -208,6 +201,8 @@ class ConfluenceClient:
             if not _same_host(self.site_root, url):
                 raise ConfluenceError(0, "next page was not on the Confluence host")
             return url
+        if url.startswith(("/rest/", "/download/")):
+            return self.wiki_root + url
         if url.startswith("/"):
             return self.site_root + url
         raise ConfluenceError(0, "unexpected next page link")
@@ -242,122 +237,6 @@ class ConfluenceClient:
         return payload
 
 
-class _Redirect(Exception):
-    def __init__(self, url: str):
-        self.url = url
-
-
-class _CaptureRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        try:
-            fp.read()
-        finally:
-            fp.close()
-        raise _Redirect(newurl)
-
-    http_error_308 = urllib.request.HTTPRedirectHandler.http_error_302
-
-
-def _request_with_retries(
-    opener,
-    url: str,
-    auth: str,
-    timeout: float,
-    accept: str,
-    attempts: int,
-    data: bytes | None = None,
-):
-    delay = 1.0
-    last_error: ConfluenceError | None = None
-    for attempt in range(attempts):
-        try:
-            return _read(opener, url, auth, timeout, accept, data)
-        except urllib.error.HTTPError as error:
-            payload = error.read()
-            if error.code == 429 and attempt + 1 < attempts:
-                time.sleep(_retry_seconds(error.headers.get("Retry-After"), delay))
-                delay = min(delay * 2, 30)
-                continue
-            return error.code, payload
-        except urllib.error.URLError as error:
-            last_error = ConfluenceError(0, str(error.reason))
-            if attempt + 1 < attempts:
-                time.sleep(delay)
-                delay = min(delay * 2, 30)
-                continue
-        except ConfluenceError as error:
-            last_error = error
-            break
-    raise last_error or ConfluenceError(0, "request failed")
-
-
-def urllib_transport(email: str, token: str, timeout: float = 30.0, attempts: int = 5) -> Transport:
-    auth = _basic_auth(email, token)
-    opener = urllib.request.build_opener(_CaptureRedirect)
-
-    def transport(url: str) -> tuple[int, dict | None]:
-        status, body = _request_with_retries(
-            opener, url, auth, timeout, "application/json", attempts
-        )
-        return status, _parse_json(body)
-
-    return transport
-
-
-def urllib_post(email: str, token: str, timeout: float = 30.0, attempts: int = 5) -> Post:
-    auth = _basic_auth(email, token)
-    opener = urllib.request.build_opener(_CaptureRedirect)
-
-    def post(url: str, payload: dict) -> tuple[int, dict | None]:
-        data = json.dumps(payload).encode("utf-8")
-        status, body = _request_with_retries(
-            opener, url, auth, timeout, "application/json", attempts, data
-        )
-        return status, _parse_json(body)
-
-    return post
-
-
-def urllib_download(email: str, token: str, timeout: float = 60.0, attempts: int = 5) -> Download:
-    auth = _basic_auth(email, token)
-    opener = urllib.request.build_opener(_CaptureRedirect)
-
-    def download(url: str) -> tuple[int, bytes]:
-        return _request_with_retries(opener, url, auth, timeout, "*/*", attempts)
-
-    return download
-
-
-def _read(
-    opener,
-    url: str,
-    auth: str,
-    timeout: float,
-    accept: str,
-    data: bytes | None = None,
-) -> tuple[int, bytes]:
-    current = url
-    send_auth = True
-    for _hop in range(5):
-        headers = {"Accept": accept, "User-Agent": "supreme-octo-doodle"}
-        if data is not None:
-            headers["Content-Type"] = "application/json"
-        if send_auth:
-            headers["Authorization"] = f"Basic {auth}"
-        request = urllib.request.Request(current, data=data, headers=headers)
-        try:
-            with opener.open(request, timeout=timeout) as response:
-                return response.status, response.read()
-        except _Redirect as redirect:
-            if not redirect.url.startswith("https://"):
-                raise ConfluenceError(0, "redirect was not https") from redirect
-            if data is not None and not _same_host(current, redirect.url):
-                raise ConfluenceError(0, "redirect left the Confluence host") from redirect
-            send_auth = _same_host(current, redirect.url)
-            current = redirect.url
-    raise ConfluenceError(0, "redirect did not finish")
-
-
 def extract_tree(client: ConfluenceClient, page_id: str, out_dir: Path) -> ExtractResult:
     if not _PAGE_ID.match(page_id):
         raise ConfluenceError(0, "PAGE must be a Confluence page id")
@@ -385,8 +264,8 @@ def extract_tree(client: ConfluenceClient, page_id: str, out_dir: Path) -> Extra
     except ConfluenceAuthError:
         raise
     except ConfluenceError as error:
-        result.failed.append((page_id, str(error)))
-        print(f"failed {page_id}: {error}", file=sys.stderr)
+        result.failed.append((page_id, f"descendants: {error}"))
+        print(f"failed {page_id} descendants: {error}", file=sys.stderr)
         descendants = []
 
     for item in descendants:
@@ -423,44 +302,134 @@ def extract_tree(client: ConfluenceClient, page_id: str, out_dir: Path) -> Extra
             continue
         pages.append(page)
 
-    titles = {_page_id(page): str(page.get("title") or "") for page in pages}
+    ready: list[_Prepared] = []
     for page in pages:
         current_id = _page_id(page)
         try:
-            _write_page(client, page, titles, out_dir, result)
+            ready.append(_prepare_page(client, page, out_dir, result))
         except ConfluenceAuthError:
             raise
         except ConfluenceError as error:
             result.failed.append((current_id, str(error)))
             print(f"failed {current_id}: {error}", file=sys.stderr)
+    titles = {item.page_id: item.title for item in ready}
+    for item in ready:
+        _write_prepared(client, item, titles, out_dir, result)
     _summarize(result)
     return result
 
 
-def _write_page(
+@dataclass
+class _Prepared:
+    page: dict
+    page_id: str
+    title: str
+    footer: list[dict]
+    inline: list[dict]
+    attachments: list[dict]
+    names: dict[str, str]
+    notes: list[str]
+    comment_error: str
+    inline_error: str
+
+
+def _prepare_page(
     client: ConfluenceClient,
     page: dict,
+    out_dir: Path,
+    result: ExtractResult,
+) -> _Prepared:
+    page_id = _page_id(page)
+    _document_body(page.get("body"), f"page {page_id}")
+    footer: list[dict] = []
+    inline: list[dict] = []
+    attachments: list[dict] = []
+    names: dict[str, str] = {}
+    notes: list[str] = []
+    comment_error = ""
+    inline_error = ""
+    try:
+        footer, inline = client.get_page_comments(page_id)
+    except ConfluenceAuthError:
+        raise
+    except ConfluenceError as error:
+        comment_error = str(error)
+        inline_error = str(error)
+        result.failed.append((page_id, f"comments: {error}"))
+        print(f"failed {page_id} comments: {error}", file=sys.stderr)
+    try:
+        attachments = client.get_attachments(page_id)
+    except ConfluenceAuthError:
+        raise
+    except ConfluenceError as error:
+        notes.append(f"_Could not load attachments: {error}._")
+        result.failed.append((page_id, f"attachments: {error}"))
+        print(f"failed {page_id} attachments: {error}", file=sys.stderr)
+    try:
+        names = client.display_names(_account_ids(page, [footer, inline]))
+    except ConfluenceAuthError:
+        raise
+    except ConfluenceError as error:
+        notes.append(f"_Could not load account names: {error}._")
+        result.failed.append((page_id, f"names: {error}"))
+        print(f"failed {page_id} names: {error}", file=sys.stderr)
+    return _Prepared(
+        page=page,
+        page_id=page_id,
+        title=str(page.get("title") or ""),
+        footer=footer,
+        inline=inline,
+        attachments=attachments,
+        names=names,
+        notes=notes,
+        comment_error=comment_error,
+        inline_error=inline_error,
+    )
+
+
+def _write_prepared(
+    client: ConfluenceClient,
+    item: _Prepared,
     titles: dict[str, str],
     out_dir: Path,
     result: ExtractResult,
 ) -> None:
-    page_id = _page_id(page)
-    footer = client.get_footer_comments(page_id)
-    inline = client.get_inline_comments(page_id)
-    attachments = client.get_attachments(page_id)
-    names = client.display_names(_account_ids(page, [footer, inline]))
+    page_id = item.page_id
     path = out_dir / f"{page_id}.md"
     images = PageImages(
-        attachments=attachments,
+        attachments=item.attachments,
         download=lambda attachment: client.download_attachment(page_id, attachment),
         directory=out_dir / page_id,
         folder_name=page_id,
         page_id=page_id,
     )
+    seen = {page_id}
+    include_problems: list[str] = []
+
+    def include(node: dict) -> str | None:
+        return _expand_include(client, node, seen, images, include, include_problems)
+
     path.write_text(
-        render_page(page, footer, inline, names, client.wiki_root, titles, images),
+        render_page(
+            item.page,
+            item.footer,
+            item.inline,
+            item.names,
+            client.wiki_root,
+            titles,
+            images,
+            include,
+            item.notes,
+            item.comment_error,
+            item.inline_error,
+        ),
         encoding="utf-8",
     )
+    for failure in images.failures:
+        result.failed.append((page_id, failure))
+    for problem in include_problems:
+        result.failed.append((page_id, problem))
+        print(f"failed {page_id}: {problem}", file=sys.stderr)
     result.wrote.append(path)
     print(f"wrote {path}", file=sys.stderr)
 
@@ -473,6 +442,10 @@ def render_page(
     wiki_root: str,
     titles: dict[str, str] | None = None,
     images: Callable[[dict], str | None] | None = None,
+    include: Callable[[dict], str | None] | None = None,
+    notes: list[str] | None = None,
+    comment_error: str = "",
+    inline_error: str = "",
 ) -> str:
     page_id = _page_id(page)
     title_text = _single_line(str(page.get("title") or ""))
@@ -485,9 +458,17 @@ def render_page(
     if updated:
         lines.append(f"- **Updated:** {updated}")
     lines.append(f"- **Author:** {_page_author(page, names)}")
-    body = adf_to_markdown(_adf_value(page.get("body"), f"page {page_id}"), images).strip()
-    footer_block = _render_thread(footer, names, images, 3) or "_No comments._"
-    inline_block = _render_thread(inline, names, images, 3) or "_No inline comments._"
+    editor = _updated_by(page, names)
+    if editor:
+        lines.append(f"- **Updated by:** {editor}")
+    lines.extend(notes or [])
+    body = adf_to_markdown(
+        _document_body(page.get("body"), f"page {page_id}"),
+        images,
+        include,
+    ).strip()
+    footer_block = _comment_section(footer, names, images, comment_error, "comments")
+    inline_block = _comment_section(inline, names, images, inline_error, "inline comments")
     meta = "\n".join(lines)
     return (
         f"{title}\n\n"
@@ -500,16 +481,30 @@ def render_page(
     )
 
 
+def _comment_section(
+    comments: list[dict],
+    names: dict[str, str],
+    images: Callable[[dict], str | None] | None,
+    error: str,
+    label: str,
+) -> str:
+    if error:
+        return f"_Could not load {label}: {error}._"
+    return _render_thread(comments, names, images, 3) or f"_No {label}._"
+
+
 def _render_thread(
     comments: list,
     names: dict[str, str],
     images: Callable[[dict], str | None] | None,
     level: int,
+    seen: set[str] | None = None,
 ) -> str:
     blocks: list[str] = []
+    visited = seen if seen is not None else set()
     for comment in comments:
         if isinstance(comment, dict):
-            blocks.append(_render_comment(comment, names, images, level))
+            blocks.append(_render_comment(comment, names, images, level, visited))
     return "\n\n".join(block for block in blocks if block)
 
 
@@ -518,27 +513,44 @@ def _render_comment(
     names: dict[str, str],
     images: Callable[[dict], str | None] | None,
     level: int,
+    seen: set[str],
 ) -> str:
-    author = _author_name(comment, names)
-    created = _version_time(comment)
+    comment_id = str(comment.get("id") or "")
+    if comment_id and comment_id in seen:
+        return ""
+    if comment_id:
+        seen.add(comment_id)
+    author, created, updated = _comment_times(comment, names)
     resolution = _single_line(str(comment.get("resolutionStatus") or ""))
-    heading = f"{'#' * min(max(level, 3), 6)} {author}"
-    if created:
-        heading = f"{heading} — {created}"
-    if resolution:
-        heading = f"{heading} ({resolution})"
-    parts = [heading]
+    if level <= 3:
+        heading = f"### {author}"
+        if created:
+            heading = f"{heading} — {created}"
+        if resolution:
+            heading = f"{heading} ({resolution})"
+        parts = [heading]
+    else:
+        heading = f"**{author}**"
+        if created:
+            heading = f"{heading} — {created}"
+        if resolution:
+            heading = f"{heading} ({resolution})"
+        parts = [heading]
+    if updated:
+        parts.append(updated)
     selection = _selection(comment)
     if selection:
         parts.append(_blockquote(selection))
-    comment_id = str(comment.get("id") or "")
     body = adf_to_markdown(_adf_value(comment.get("body"), f"comment {comment_id}"), images).strip()
     if body:
         parts.append(body)
-    replies = _render_thread(comment.get("replies") or [], names, images, level + 1)
+    replies = _render_thread(comment.get("replies") or [], names, images, level + 1, seen)
     if replies:
         parts.append(replies)
-    return "\n\n".join(parts)
+    rendered = "\n\n".join(parts)
+    if level > 3:
+        rendered = "\n".join(f"> {line}" if line else ">" for line in rendered.splitlines())
+    return rendered
 
 
 def format_confluence_time(value: str) -> str:
@@ -582,9 +594,25 @@ class PageImages:
         self._saved: dict[str, str] = {}
         self._used_names: set[str] = set()
         self._warned: set[int] = set()
+        self.failures: list[str] = []
+
+    def add_attachments(self, attachments: object) -> None:
+        for item in attachments or []:
+            if not isinstance(item, dict) or not _is_image(item):
+                continue
+            self._images.append(item)
+            file_id = str(item.get("fileId") or "")
+            if file_id and file_id not in self._by_file_id:
+                self._by_file_id[file_id] = item
+            attachment_id = item.get("id")
+            if attachment_id is not None and str(attachment_id) not in self._by_id:
+                self._by_id[str(attachment_id)] = item
+            name = _filename_key(str(item.get("title") or ""))
+            if name:
+                self._by_name.setdefault(name, []).append(item)
 
     def __call__(self, node: dict) -> str | None:
-        if node.get("type") != "media":
+        if node.get("type") not in ("media", "mediaInline"):
             return None
         attrs = node.get("attrs") or {}
         if str(attrs.get("type") or "") == "external":
@@ -621,6 +649,7 @@ class PageImages:
         attrs = node.get("attrs") or {}
         name = attrs.get("alt") or attrs.get("id") or "image"
         print(f"failed image {self._page_id} {name}: no matching attachment", file=sys.stderr)
+        self.failures.append(f"image {name}: no matching attachment")
 
     def _save(self, attachment: dict) -> str | None:
         attachment_id = str(attachment.get("id"))
@@ -630,8 +659,11 @@ class PageImages:
         filename = str(attachment.get("title") or attachment_id)
         try:
             data = self._download(attachment)
+        except ConfluenceAuthError:
+            raise
         except ConfluenceError as error:
             print(f"failed image {self._page_id} {filename}: {error}", file=sys.stderr)
+            self.failures.append(f"image {filename}: {error}")
             return None
         safe_name = self._unique_filename(filename, attachment_id)
         self._directory.mkdir(parents=True, exist_ok=True)
@@ -700,7 +732,7 @@ def _attachment_download_url(wiki_root: str, page_id: str, attachment: dict) -> 
 
 def _account_ids(page: dict, threads: list[list[dict]]) -> list[str]:
     version = page.get("version") if isinstance(page.get("version"), dict) else {}
-    ids = [str(account_id) for account_id in (version.get("authorId"), page.get("authorId")) if account_id]
+    ids = [str(account_id) for account_id in (page.get("authorId"), version.get("authorId")) if account_id]
     for thread in threads:
         ids.extend(_comment_account_ids(thread))
     return ids
@@ -712,8 +744,9 @@ def _comment_account_ids(comments: list) -> list[str]:
         if not isinstance(comment, dict):
             continue
         version = comment.get("version") if isinstance(comment.get("version"), dict) else {}
-        if version.get("authorId"):
-            ids.append(str(version["authorId"]))
+        for account_id in (comment.get("createdBy"), version.get("authorId")):
+            if account_id:
+                ids.append(str(account_id))
         replies = comment.get("replies") or []
         if isinstance(replies, list):
             ids.extend(_comment_account_ids(replies))
@@ -721,19 +754,55 @@ def _comment_account_ids(comments: list) -> list[str]:
 
 
 def _page_author(page: dict, names: dict[str, str]) -> str:
+    account_id = str(page.get("authorId") or "")
+    if not account_id:
+        version = page.get("version") if isinstance(page.get("version"), dict) else {}
+        account_id = str(version.get("authorId") or "")
+    if not account_id:
+        return "Unknown"
+    return _single_line(names.get(account_id) or account_id)
+
+
+def _updated_by(page: dict, names: dict[str, str]) -> str:
     version = page.get("version") if isinstance(page.get("version"), dict) else {}
-    account_id = str(version.get("authorId") or page.get("authorId") or "")
-    if not account_id:
-        return "Unknown"
-    return names.get(account_id) or account_id
+    editor = str(version.get("authorId") or "")
+    creator = str(page.get("authorId") or "")
+    if not editor or not creator or editor == creator:
+        return ""
+    return _single_line(names.get(editor) or editor)
 
 
-def _author_name(comment: dict, names: dict[str, str]) -> str:
+def _comment_times(comment: dict, names: dict[str, str]) -> tuple[str, str, str]:
     version = comment.get("version") if isinstance(comment.get("version"), dict) else {}
-    account_id = str(version.get("authorId") or "")
-    if not account_id:
-        return "Unknown"
-    return names.get(account_id) or account_id
+    try:
+        number = int(version.get("number") or 1)
+    except (TypeError, ValueError):
+        number = 1
+    created_at = format_confluence_time(str(comment.get("createdAt") or ""))
+    version_at = format_confluence_time(str(version.get("createdAt") or ""))
+    creator_id = str(comment.get("createdBy") or "")
+    editor_id = str(version.get("authorId") or "")
+    if creator_id or created_at:
+        author = _named(creator_id, str(comment.get("authorName") or ""), names)
+        created = created_at or (version_at if number <= 1 else "")
+    else:
+        author = _named(editor_id, str(version.get("displayName") or ""), names)
+        created = version_at
+    updated = ""
+    if number > 1 and version_at:
+        editor = _named(editor_id, str(version.get("displayName") or ""), names)
+        updated = f"_Updated {version_at} by {editor}._"
+    return author, created, updated
+
+
+def _named(account_id: str, display: str, names: dict[str, str]) -> str:
+    if display:
+        return _single_line(display)
+    if account_id and account_id in names:
+        return _single_line(names[account_id])
+    if account_id:
+        return _single_line(account_id)
+    return "Unknown"
 
 
 def _version_time(content: dict) -> str:
@@ -785,6 +854,12 @@ def _blockquote(value: str) -> str:
     return "\n".join(f"> {_single_line(line)}" if line else ">" for line in value.splitlines())
 
 
+def _document_body(body: object, label: str) -> object:
+    if not isinstance(body, dict) or "atlas_doc_format" not in body:
+        raise ConfluenceError(0, f"{label} body was missing atlas_doc_format")
+    return _adf_value(body, label)
+
+
 def _adf_value(body: object, label: str) -> object:
     if not isinstance(body, dict):
         return None
@@ -817,29 +892,6 @@ def _body_query() -> list[tuple[str, str]]:
     return [("body-format", "atlas_doc_format")]
 
 
-def _comment_query() -> list[tuple[str, str]]:
-    return [
-        ("body-format", "atlas_doc_format"),
-        ("status", "current"),
-        ("sort", "created-date"),
-        ("limit", "250"),
-    ]
-
-
-def _inline_query() -> list[tuple[str, str]]:
-    query = _comment_query()
-    query.extend(("resolution-status", status) for status in _RESOLUTION)
-    return query
-
-
-def _reply_query() -> list[tuple[str, str]]:
-    return [
-        ("body-format", "atlas_doc_format"),
-        ("sort", "created-date"),
-        ("limit", "250"),
-    ]
-
-
 def _page_id(page: dict) -> str:
     page_id = str(page.get("id") or "")
     if not _PAGE_ID.match(page_id):
@@ -858,8 +910,191 @@ def _quote(value: str) -> str:
     return urllib.parse.quote(value, safe="")
 
 
-def _basic_auth(email: str, token: str) -> str:
-    return base64.b64encode(f"{email}:{token}".encode()).decode("ascii")
+def _cql_quote(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _comment_threads(flat: list[dict]) -> tuple[list[dict], list[dict]]:
+    mapped: dict[str, dict] = {}
+    order: list[str] = []
+    for raw in flat:
+        comment_id = str(raw.get("id") or "")
+        if not comment_id or comment_id in mapped:
+            continue
+        mapped[comment_id] = _map_comment(raw)
+        order.append(comment_id)
+    footer: list[dict] = []
+    inline: list[dict] = []
+    parents = {
+        comment_id: str(mapped[comment_id].get("_parent") or "")
+        for comment_id in order
+    }
+    for comment_id in order:
+        comment = mapped[comment_id]
+        parent_id = parents[comment_id]
+        parent = mapped.get(parent_id) if parent_id and parent_id != comment_id else None
+        if parent is not None and _comment_link_cycles(comment_id, parent_id, parents):
+            parent = None
+        if parent is None:
+            target = inline if comment.get("_location") == "inline" else footer
+            target.append(comment)
+        else:
+            replies = parent.get("replies")
+            if not isinstance(replies, list):
+                replies = []
+                parent["replies"] = replies
+            replies.append(comment)
+    for comment in mapped.values():
+        comment.pop("_location", None)
+        comment.pop("_parent", None)
+    return footer, inline
+
+
+def _comment_link_cycles(comment_id: str, parent_id: str, parents: dict[str, str]) -> bool:
+    seen = {comment_id}
+    current = parent_id
+    while current:
+        if current in seen:
+            return True
+        seen.add(current)
+        current = parents.get(current, "")
+    return False
+
+
+def _map_comment(raw: dict) -> dict:
+    extensions = raw.get("extensions") if isinstance(raw.get("extensions"), dict) else {}
+    location = str(extensions.get("location") or "footer").lower()
+    resolution = raw.get("resolutionStatus")
+    resolved = extensions.get("resolution") if isinstance(extensions.get("resolution"), dict) else {}
+    if not resolution:
+        resolution = resolved.get("status") or ""
+    inline_props = (
+        extensions.get("inlineProperties")
+        if isinstance(extensions.get("inlineProperties"), dict)
+        else {}
+    )
+    selection = str(
+        inline_props.get("originalSelection") or inline_props.get("inlineOriginalSelection") or ""
+    )
+    version = raw.get("version") if isinstance(raw.get("version"), dict) else {}
+    by = version.get("by") if isinstance(version.get("by"), dict) else {}
+    history = raw.get("history") if isinstance(raw.get("history"), dict) else {}
+    created_by = history.get("createdBy") if isinstance(history.get("createdBy"), dict) else {}
+    ancestors = raw.get("ancestors") if isinstance(raw.get("ancestors"), list) else []
+    parent = ""
+    for ancestor in reversed(ancestors):
+        if isinstance(ancestor, dict) and str(ancestor.get("type") or "") == "comment":
+            parent = str(ancestor.get("id") or "")
+            break
+    body = raw.get("body") if isinstance(raw.get("body"), dict) else {}
+    atlas = body.get("atlas_doc_format")
+    mapped_body = {"atlas_doc_format": atlas} if atlas is not None else {}
+    properties = {"inlineOriginalSelection": selection} if selection.strip() else {}
+    return {
+        "id": str(raw.get("id") or ""),
+        "resolutionStatus": str(resolution or ""),
+        "properties": properties,
+        "body": mapped_body,
+        "replies": [],
+        "version": {
+            "number": version.get("number") or 1,
+            "authorId": str(by.get("accountId") or version.get("authorId") or ""),
+            "createdAt": str(version.get("when") or version.get("createdAt") or ""),
+            "displayName": str(by.get("displayName") or ""),
+        },
+        "createdAt": str(history.get("createdDate") or raw.get("createdAt") or ""),
+        "createdBy": str(created_by.get("accountId") or raw.get("createdBy") or ""),
+        "authorName": str(created_by.get("displayName") or raw.get("authorName") or ""),
+        "_parent": parent,
+        "_location": "inline" if location == "inline" else "footer",
+    }
+
+
+def _expand_include(
+    client: ConfluenceClient,
+    node: dict,
+    seen: set[str],
+    images: PageImages,
+    include: Callable[[dict], str | None],
+    problems: list[str],
+) -> str | None:
+    attrs = node.get("attrs") if isinstance(node.get("attrs"), dict) else {}
+    key = str(attrs.get("extensionKey") or "")
+    if key not in ("include", "excerpt-include"):
+        return None
+    page_id = _include_page_id(attrs)
+    title, space = _include_title_space(attrs)
+    label = title or page_id or key
+    if not page_id and title:
+        try:
+            page_id = client.find_page(title, space) or ""
+        except ConfluenceAuthError:
+            raise
+        except ConfluenceError as error:
+            problems.append(f"include {label}: {error}")
+            return None
+    if not page_id:
+        problems.append(f"include {label}: page was not found")
+        return None
+    if page_id in seen:
+        problems.append(f"include {label}: cycle")
+        return None
+    seen.add(page_id)
+    try:
+        page = client.get_page(page_id)
+        if page is None:
+            problems.append(f"include {label}: page was not found")
+            return None
+        try:
+            attachments = client.get_attachments(page_id)
+        except ConfluenceAuthError:
+            raise
+        except ConfluenceError as error:
+            attachments = []
+            problems.append(f"include {label} attachments: {error}")
+        images.add_attachments(attachments)
+        rendered = adf_to_markdown(
+            _document_body(page.get("body"), f"page {page_id}"),
+            images,
+            include,
+        ).strip()
+        return rendered
+    except ConfluenceAuthError:
+        raise
+    except ConfluenceError as error:
+        problems.append(f"include {label}: {error}")
+        return None
+    finally:
+        seen.discard(page_id)
+
+
+def _include_page_id(attrs: dict) -> str:
+    params = _macro_params(attrs)
+    for key in ("contentId", "pageId", "content-id"):
+        value = _param_value(params, key)
+        if _PAGE_ID.match(value):
+            return value
+    return ""
+
+
+def _include_title_space(attrs: dict) -> tuple[str, str]:
+    params = _macro_params(attrs)
+    return _param_value(params, "page", ""), _param_value(params, "space", "spaceKey")
+
+
+def _macro_params(attrs: dict) -> dict:
+    parameters = attrs.get("parameters") if isinstance(attrs.get("parameters"), dict) else {}
+    macro = parameters.get("macroParams") if isinstance(parameters, dict) else {}
+    return macro if isinstance(macro, dict) else {}
+
+
+def _param_value(params: dict, *keys: str) -> str:
+    for key in keys:
+        item = params.get(key)
+        value = item.get("value") if isinstance(item, dict) else item
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
 
 
 def _filename_key(name: str) -> str:
@@ -900,22 +1135,6 @@ def _error_detail(payload: dict) -> str:
     return str(message)
 
 
-def _parse_json(raw: bytes) -> dict | None:
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def _retry_seconds(header: str | None, fallback: float) -> float:
-    if header and header.strip().isdigit():
-        return min(float(header.strip()), 60.0)
-    return fallback
-
-
 def _summarize(result: ExtractResult) -> None:
     print(
         f"wrote {len(result.wrote)}, missing {len(result.missing)}, "
@@ -941,9 +1160,9 @@ def build_client_from_env() -> ConfluenceClient:
         raise ConfluenceError(0, "set " + ", ".join(missing))
     return ConfluenceClient(
         base_url,
-        urllib_transport(email, token),
-        urllib_download(email, token),
-        urllib_post(email, token),
+        json_transport(email, token, ConfluenceError),
+        bytes_download(email, token, ConfluenceError),
+        json_post(email, token, ConfluenceError),
     )
 
 

@@ -83,6 +83,42 @@ def _media(alt: str, file_id: str) -> dict:
     return {"type": "media", "attrs": {"type": "file", "id": file_id, "alt": alt}}
 
 
+def _search_comment(
+    comment_id: str,
+    text: str,
+    author: str,
+    name: str,
+    created: str,
+    parent: str = "",
+    location: str = "footer",
+    resolution: str = "",
+    selection: str = "",
+) -> dict:
+    ancestors = [{"id": parent, "type": "comment"}] if parent else []
+    extensions: dict = {"location": location}
+    if resolution:
+        extensions["resolution"] = {"status": resolution}
+    if selection:
+        extensions["inlineProperties"] = {"originalSelection": selection}
+    return {
+        "id": comment_id,
+        "type": "comment",
+        "status": "current",
+        "body": {"atlas_doc_format": {"value": _adf(text)}},
+        "version": {
+            "number": 1,
+            "when": created,
+            "by": {"accountId": author, "displayName": name},
+        },
+        "history": {
+            "createdDate": created,
+            "createdBy": {"accountId": author, "displayName": name},
+        },
+        "ancestors": ancestors,
+        "extensions": extensions,
+    }
+
+
 def _empty(_url: str) -> tuple[int, dict]:
     return 200, {"results": []}
 
@@ -137,9 +173,9 @@ class RenderTests(unittest.TestCase):
         self.assertIn("Root body", text)
         self.assertIn("### Mia Krystof — 2021-01-17 12:34 +0000", text)
         self.assertIn("Hello", text)
-        self.assertIn("#### Ada Lovelace — 2021-01-18 09:00 +0000", text)
+        self.assertIn("> **Ada Lovelace** — 2021-01-18 09:00 +0000", text)
         self.assertIn("A reply", text)
-        self.assertIn("##### Ada Lovelace — 2021-01-18 10:00 +0000", text)
+        self.assertIn("> > **Ada Lovelace** — 2021-01-18 10:00 +0000", text)
         self.assertIn("### Mia Krystof — 2021-01-17 13:00 +0000 (open)", text)
         self.assertIn("> Root body", text)
         self.assertIn("Please fix", text)
@@ -150,7 +186,13 @@ class RenderTests(unittest.TestCase):
         self.assertLess(text.index("Hello"), text.index("A reply"))
 
     def test_empty_page_uses_the_id_and_placeholder_sections(self):
-        text = render_page({"id": "5", "title": "", "body": {}}, [], [], {}, WIKI)
+        text = render_page(
+            {"id": "5", "title": "", "body": {"atlas_doc_format": {"value": ""}}},
+            [],
+            [],
+            {},
+            WIKI,
+        )
         self.assertIn("# 5", text)
         self.assertIn(f"{WIKI}/pages/viewpage.action?pageId=5", text)
         self.assertIn("- **Author:** Unknown", text)
@@ -159,6 +201,47 @@ class RenderTests(unittest.TestCase):
         self.assertIn("_No inline comments._", text)
         self.assertNotIn("**Parent:**", text)
         self.assertNotIn("**Updated:**", text)
+
+    def test_missing_document_body_raises(self):
+        with self.assertRaises(ConfluenceError) as caught:
+            render_page({"id": "5", "title": "", "body": {}}, [], [], {}, WIKI)
+        self.assertIn("atlas_doc_format", str(caught.exception))
+
+    def test_updated_by_is_shown_when_the_editor_differs(self):
+        page = _page("6", "Child", None, "Body", "acc-ada")
+        page["version"]["authorId"] = "acc-mia"
+        text = render_page(
+            page,
+            [],
+            [],
+            {"acc-ada": "Ada Lovelace", "acc-mia": "Mia Krystof"},
+            WIKI,
+        )
+        self.assertIn("- **Author:** Ada Lovelace", text)
+        self.assertIn("- **Updated by:** Mia Krystof", text)
+
+    def test_account_id_is_escaped_when_rendered(self):
+        page = _page("6", "Child", None, "Body", "acc_ada")
+        text = render_page(page, [], [], {}, WIKI)
+        self.assertIn(r"- **Author:** acc\_ada", text)
+
+    def test_edited_comment_keeps_the_original_time(self):
+        comment = _comment("10", "Hello", "acc-mia", "2021-02-01T00:00:00.000Z")
+        comment["version"]["number"] = 2
+        comment["createdAt"] = "2021-01-17T12:34:00.000Z"
+        comment["createdBy"] = "acc-ada"
+        comment["authorName"] = "Ada Lovelace"
+        comment["version"]["displayName"] = "Mia Krystof"
+        text = render_page(
+            _page("1", "Runbook", None, "Body"),
+            [comment],
+            [],
+            {},
+            WIKI,
+        )
+        self.assertIn("### Ada Lovelace — 2021-01-17 12:34 +0000", text)
+        self.assertIn("_Updated 2021-02-01 00:00 +0000 by Mia Krystof._", text)
+        self.assertNotIn("### Mia Krystof — 2021-02-01", text)
 
     def test_folder_parent_is_omitted(self):
         page = _page("6", "Child", "1", "Body")
@@ -194,6 +277,8 @@ class ImageTests(unittest.TestCase):
                 "2",
             )
             self.assertEqual(images(_media("Diagram", "file-50")), "![Diagram](2/shot.png)")
+            inline = {"type": "mediaInline", "attrs": {"type": "file", "id": "file-50", "alt": "Inline"}}
+            self.assertEqual(images(inline), "![Inline](2/shot.png)")
             self.assertEqual(images(_media("Other", "file-50")), "![Other](2/shot.png)")
             self.assertEqual((Path(directory) / "shot.png").read_bytes(), b"png")
             self.assertEqual(calls, ["50"])
@@ -234,11 +319,26 @@ class ImageTests(unittest.TestCase):
             self.assertIsNone(images(_media("Diagram", "file-50")))
             self.assertIsNone(images(_media("notes.pdf", "file-60")))
             self.assertEqual(list(Path(directory).iterdir()), [])
+            self.assertTrue(any("shot.png" in failure for failure in images.failures))
             external = {
                 "type": "media",
                 "attrs": {"type": "external", "url": "https://cdn.example/a.png", "alt": "Remote"},
             }
             self.assertEqual(images(external), "![Remote](https://cdn.example/a.png)")
+
+    def test_auth_failure_while_downloading_an_image_stops_the_export(self):
+        def download(_attachment: dict) -> bytes:
+            raise ConfluenceAuthError(401, "check JIRA_EMAIL and JIRA_API_TOKEN")
+
+        images = PageImages(
+            [_attachment("50", "shot.png", "image/png", "file-50")],
+            download,
+            Path("unused"),
+            "2",
+            "2",
+        )
+        with self.assertRaises(ConfluenceAuthError):
+            images(_media("Diagram", "file-50"))
 
 
 class ExtractTests(unittest.TestCase):
@@ -265,36 +365,38 @@ class ExtractTests(unittest.TestCase):
                         {"id": "8", "type": "page", "status": "archived", "title": "Old"},
                     ]
                 }
-            if path.endswith("/pages/1/footer-comments"):
-                self.assertEqual(query["body-format"], ["atlas_doc_format"])
-                self.assertEqual(query["sort"], ["created-date"])
-                self.assertEqual(query["status"], ["current"])
-                return 200, {
-                    "results": [_comment("10", "Hello", "acc-mia", "2021-01-17T12:34:00.000Z")]
-                }
-            if path.endswith("/pages/1/inline-comments"):
-                self.assertEqual(
-                    query["resolution-status"],
-                    ["open", "resolved", "reopened", "dangling"],
-                )
-                return 200, {
-                    "results": [
-                        _comment(
-                            "20",
-                            "Please fix",
-                            "acc-mia",
-                            "2021-01-17T13:00:00.000Z",
-                            "open",
-                            "Root body",
-                        )
-                    ]
-                }
-            if path.endswith("/footer-comments/10/children"):
-                self.assertEqual(query["body-format"], ["atlas_doc_format"])
-                return 200, {
-                    "results": [_comment("11", "A reply", "acc-ada", "2021-01-18T09:00:00.000Z")]
-                }
-            if path.endswith("/children"):
+            if path.endswith("/content/search"):
+                cql = query.get("cql", [""])[0]
+                if "container = 1" in cql:
+                    return 200, {
+                        "results": [
+                            _search_comment(
+                                "10",
+                                "Hello",
+                                "acc-mia",
+                                "Mia Krystof",
+                                "2021-01-17T12:34:00.000Z",
+                            ),
+                            _search_comment(
+                                "11",
+                                "A reply",
+                                "acc-ada",
+                                "Ada Lovelace",
+                                "2021-01-18T09:00:00.000Z",
+                                parent="10",
+                            ),
+                            _search_comment(
+                                "20",
+                                "Please fix",
+                                "acc-mia",
+                                "Mia Krystof",
+                                "2021-01-17T13:00:00.000Z",
+                                location="inline",
+                                resolution="open",
+                                selection="Root body",
+                            ),
+                        ]
+                    }
                 return 200, {"results": []}
             if path.endswith("/pages/2/attachments"):
                 return 200, {"results": [_attachment("50", "shot.png", "image/png", "file-50")]}
@@ -348,7 +450,7 @@ class ExtractTests(unittest.TestCase):
             self.assertIn("Root body", root)
             self.assertIn("### Mia Krystof — 2021-01-17 12:34 +0000", root)
             self.assertIn("Hello", root)
-            self.assertIn("#### Ada Lovelace — 2021-01-18 09:00 +0000", root)
+            self.assertIn("> **Ada Lovelace** — 2021-01-18 09:00 +0000", root)
             self.assertIn("A reply", root)
             self.assertIn("> Root body", root)
             self.assertIn("(open)", root)
@@ -416,7 +518,7 @@ class ExtractTests(unittest.TestCase):
                 Path(directory),
             )
         self.assertEqual([path.name for path in result.wrote], ["1.md"])
-        self.assertEqual(result.failed, [("1", "HTTP 500: nope")])
+        self.assertEqual(result.failed, [("1", "descendants: HTTP 500: nope")])
 
     def test_invalid_body_fails_that_page(self):
         def transport(url: str) -> tuple[int, dict | None]:
@@ -437,6 +539,158 @@ class ExtractTests(unittest.TestCase):
             )
         self.assertEqual(result.wrote, [])
         self.assertIn("not valid JSON", result.failed[0][1])
+
+    def test_comment_failure_still_writes_the_page(self):
+        def transport(url: str) -> tuple[int, dict | None]:
+            path = urllib.parse.urlparse(url).path
+            if path.endswith("/descendants"):
+                return 200, {"results": []}
+            if path.endswith("/content/search"):
+                return 500, {"message": "comments down"}
+            if path.endswith("/pages/1"):
+                return 200, _page("1", "Root", None, "Root body")
+            return _empty(url)
+
+        with TemporaryDirectory() as directory:
+            result = extract_tree(
+                ConfluenceClient("https://acme.atlassian.net", transport),
+                "1",
+                Path(directory),
+            )
+            text = result.wrote[0].read_text(encoding="utf-8")
+        self.assertIn("Root body", text)
+        self.assertIn("_Could not load comments: HTTP 500: comments down._", text)
+        self.assertNotIn("_No comments._", text)
+        self.assertEqual(result.failed, [("1", "comments: HTTP 500: comments down")])
+
+    def test_image_download_failure_still_writes_the_page(self):
+        def transport(url: str) -> tuple[int, dict | None]:
+            path = urllib.parse.urlparse(url).path
+            if path.endswith("/descendants"):
+                return 200, {"results": []}
+            if path.endswith("/attachments"):
+                return 200, {"results": [_attachment("50", "shot.png", "image/png", "file-50")]}
+            if path.endswith("/pages/1"):
+                page = _page("1", "Root", None, "Root body")
+                page["body"]["atlas_doc_format"]["value"] = {
+                    "type": "doc",
+                    "content": [{"type": "mediaSingle", "content": [_media("Diagram", "file-50")]}],
+                }
+                return 200, page
+            return _empty(url)
+
+        def download(url: str) -> tuple[int, bytes]:
+            return 404, b""
+
+        with TemporaryDirectory() as directory:
+            result = extract_tree(
+                ConfluenceClient("https://acme.atlassian.net", transport, download),
+                "1",
+                Path(directory),
+            )
+            text = result.wrote[0].read_text(encoding="utf-8")
+        self.assertIn("# Root", text)
+        self.assertEqual(result.failed, [("1", "image shot.png: HTTP 404: attachment shot.png")])
+
+    def test_failed_parent_is_not_linked_as_a_local_file(self):
+        def transport(url: str) -> tuple[int, dict | None]:
+            path = urllib.parse.urlparse(url).path
+            if path.endswith("/descendants"):
+                return 200, {"results": [{"id": "2", "type": "page", "status": "current"}]}
+            if path.endswith("/pages/1"):
+                page = _page("1", "Root", None, "Root body")
+                page["body"] = {"atlas_doc_format": {"value": "not-json"}}
+                return 200, page
+            if path.endswith("/pages/2"):
+                return 200, _page("2", "Child", "1", "Child body")
+            return _empty(url)
+
+        with TemporaryDirectory() as directory:
+            result = extract_tree(
+                ConfluenceClient("https://acme.atlassian.net", transport),
+                "1",
+                Path(directory),
+            )
+            child = result.wrote[0].read_text(encoding="utf-8")
+        self.assertEqual([path.name for path in result.wrote], ["2.md"])
+        self.assertIn(f"- **Parent:** [1]({WIKI}/pages/viewpage.action?pageId=1)", child)
+        self.assertNotIn("(1.md)", child)
+
+    def test_include_expands_by_content_id(self):
+        def transport(url: str) -> tuple[int, dict | None]:
+            path = urllib.parse.urlparse(url).path
+            if path.endswith("/descendants"):
+                return 200, {"results": []}
+            if path.endswith("/pages/1"):
+                page = _page("1", "Root", None, "Root body")
+                page["body"]["atlas_doc_format"]["value"] = {
+                    "type": "doc",
+                    "content": [
+                        {
+                            "type": "extension",
+                            "attrs": {
+                                "extensionKey": "excerpt-include",
+                                "parameters": {"macroParams": {"contentId": {"value": "3"}}},
+                            },
+                        }
+                    ],
+                }
+                return 200, page
+            if path.endswith("/pages/3"):
+                return 200, _page("3", "Shared", None, "Included text")
+            return _empty(url)
+
+        with TemporaryDirectory() as directory:
+            result = extract_tree(
+                ConfluenceClient("https://acme.atlassian.net", transport),
+                "1",
+                Path(directory),
+            )
+            text = result.wrote[0].read_text(encoding="utf-8")
+        self.assertIn("Included text", text)
+        self.assertEqual(result.failed, [])
+
+    def test_missing_include_is_a_failure(self):
+        def transport(url: str) -> tuple[int, dict | None]:
+            path = urllib.parse.urlparse(url).path
+            if path.endswith("/descendants"):
+                return 200, {"results": []}
+            if path.endswith("/pages/1"):
+                page = _page("1", "Root", None, "Root body")
+                page["body"]["atlas_doc_format"]["value"] = {
+                    "type": "doc",
+                    "content": [
+                        {
+                            "type": "extension",
+                            "attrs": {
+                                "extensionKey": "include",
+                                "parameters": {
+                                    "macroParams": {
+                                        "": {"value": "Missing"},
+                                        "space": {"value": "TEAM"},
+                                    }
+                                },
+                            },
+                        }
+                    ],
+                }
+                return 200, page
+            if path.endswith("/content/search"):
+                cql = urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("cql", [""])[0]
+                if "type = page" in cql:
+                    return 200, {"results": []}
+            return _empty(url)
+
+        with TemporaryDirectory() as directory:
+            result = extract_tree(
+                ConfluenceClient("https://acme.atlassian.net", transport),
+                "1",
+                Path(directory),
+            )
+            text = result.wrote[0].read_text(encoding="utf-8")
+        self.assertIn("**include: Missing, TEAM**", text)
+        self.assertTrue(result.failed)
+        self.assertIn("include Missing", result.failed[0][1])
 
     def test_authentication_failure_stops_the_export(self):
         client = ConfluenceClient("https://acme.atlassian.net", lambda url: (401, {"message": "no"}))
@@ -462,20 +716,41 @@ class ClientTests(unittest.TestCase):
             ConfluenceClient("http://acme.atlassian.net", lambda url: (200, {}))
 
     def test_reply_cycle_stops(self):
-        calls: list[str] = []
-
         def transport(url: str) -> tuple[int, dict | None]:
-            path = urllib.parse.urlparse(url).path
-            calls.append(path)
-            if path.endswith("/footer-comments"):
-                return 200, {"results": [{"id": "10", "body": {}}]}
-            if path.endswith("/children"):
-                return 200, {"results": [{"id": "10", "body": {}}]}
-            raise AssertionError(url)
+            self.assertIn("/rest/api/content/search", url)
+            return 200, {
+                "results": [
+                    _search_comment("10", "Root", "acc-ada", "Ada", "2021-01-17T12:34:00.000Z"),
+                    _search_comment(
+                        "11",
+                        "Reply",
+                        "acc-ada",
+                        "Ada",
+                        "2021-01-18T09:00:00.000Z",
+                        parent="10",
+                    ),
+                    {
+                        "id": "12",
+                        "type": "comment",
+                        "extensions": {"location": "footer"},
+                        "ancestors": [{"id": "12", "type": "comment"}],
+                        "body": {"atlas_doc_format": {"value": _adf("Self")}},
+                        "version": {
+                            "number": 1,
+                            "when": "2021-01-18T10:00:00.000Z",
+                            "by": {"accountId": "acc-ada", "displayName": "Ada"},
+                        },
+                        "history": {"createdDate": "2021-01-18T10:00:00.000Z"},
+                    },
+                ]
+            }
 
-        comments = ConfluenceClient("https://acme.atlassian.net", transport).get_footer_comments("1")
-        self.assertEqual(comments[0]["replies"][0]["replies"], [])
-        self.assertEqual(sum(path.endswith("/children") for path in calls), 1)
+        footer, inline = ConfluenceClient("https://acme.atlassian.net", transport).get_page_comments("1")
+        self.assertEqual(inline, [])
+        self.assertEqual([comment["id"] for comment in footer], ["10", "12"])
+        self.assertEqual(footer[0]["replies"][0]["id"], "11")
+        self.assertEqual(footer[0]["replies"][0]["replies"], [])
+        self.assertEqual(footer[1]["replies"], [])
 
     def test_pagination_stays_on_the_confluence_host(self):
         def transport(url: str) -> tuple[int, dict | None]:
@@ -500,6 +775,18 @@ class ClientTests(unittest.TestCase):
         client = ConfluenceClient("https://acme.atlassian.net", lambda url: (200, {}), download)
         with self.assertRaises(ConfluenceError):
             client.download_attachment("2", attachment)
+
+    def test_v1_search_next_joins_the_wiki_root(self):
+        seen: list[str] = []
+
+        def transport(url: str) -> tuple[int, dict | None]:
+            seen.append(url)
+            if "start=2" in url:
+                return 200, {"results": []}
+            return 200, {"results": [], "_links": {"next": "/rest/api/content/search?start=2"}}
+
+        ConfluenceClient("https://acme.atlassian.net", transport).get_page_comments("1")
+        self.assertEqual(seen[1], f"{WIKI}/rest/api/content/search?start=2")
 
 
 class MainTests(unittest.TestCase):

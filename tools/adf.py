@@ -29,6 +29,13 @@ BLOCK_TYPES = {
     "expand",
     "nestedExpand",
     "blockCard",
+    "embedCard",
+    "taskList",
+    "decisionList",
+    "layoutSection",
+    "layoutColumn",
+    "extension",
+    "bodiedExtension",
 }
 
 _PANEL_LABELS = {
@@ -41,11 +48,22 @@ _PANEL_LABELS = {
 
 
 MediaMarkdown = Callable[[dict], Optional[str]]
+IncludeMarkdown = Callable[[dict], Optional[str]]
 _media_markdown: ContextVar[MediaMarkdown | None] = ContextVar("media_markdown", default=None)
+_include_markdown: ContextVar[IncludeMarkdown | None] = ContextVar("include_markdown", default=None)
+_toc_headings: ContextVar[list[tuple[int, str]] | None] = ContextVar("toc_headings", default=None)
 
 
-def adf_to_markdown(node: object, media: MediaMarkdown | None = None) -> str:
-    token = _media_markdown.set(media)
+def adf_to_markdown(
+    node: object,
+    media: MediaMarkdown | None = None,
+    include: IncludeMarkdown | None = None,
+) -> str:
+    media_token = _media_markdown.set(media)
+    include_token = _include_markdown.set(include)
+    headings: list[tuple[int, str]] = []
+    _collect_headings(node, headings)
+    toc_token = _toc_headings.set(headings)
     try:
         if node is None:
             return ""
@@ -57,7 +75,9 @@ def adf_to_markdown(node: object, media: MediaMarkdown | None = None) -> str:
         rendered = _render(node).strip()
         return f"{rendered}\n" if rendered else ""
     finally:
-        _media_markdown.reset(token)
+        _toc_headings.reset(toc_token)
+        _include_markdown.reset(include_token)
+        _media_markdown.reset(media_token)
 
 
 def _render(node: dict) -> str:
@@ -216,6 +236,90 @@ def _block_card(node: dict) -> str:
     return _link(url, url) if url else ""
 
 
+def _task_list(node: dict) -> str:
+    lines: list[str] = []
+    for item in _children(node):
+        state = str((item.get("attrs") or {}).get("state") or "TODO").upper()
+        mark = "x" if state == "DONE" else " "
+        text = _inlines(_children(item)).replace("\n", " ").strip() or _plain_text(item).strip()
+        lines.append(f"- [{mark}] {text}".rstrip())
+    return "\n".join(lines)
+
+
+def _decision_list(node: dict) -> str:
+    lines: list[str] = []
+    for item in _children(node):
+        state = str((item.get("attrs") or {}).get("state") or "").upper()
+        label = "Decision" if state == "DECIDED" else "Undecided"
+        text = _inlines(_children(item)).replace("\n", " ").strip() or _plain_text(item).strip()
+        lines.append(f"- **{label}:** {text}".rstrip())
+    return "\n".join(lines)
+
+
+def _extension(node: dict) -> str:
+    callback = _include_markdown.get()
+    if callback is not None:
+        rendered = callback(node)
+        if rendered is not None:
+            return rendered
+    attrs = node.get("attrs") or {}
+    key = str(attrs.get("extensionKey") or "")
+    if key == "toc":
+        return _toc()
+    body = _join_blocks(_render(child) for child in _children(node))
+    label = _macro_label(attrs)
+    if body:
+        return f"**{label}**\n\n{body}"
+    return f"**{label}**"
+
+
+def _toc() -> str:
+    headings = _toc_headings.get() or []
+    if not headings:
+        return "**toc**"
+    lines = [f"{'  ' * max(level - 1, 0)}- {text}" for level, text in headings]
+    return "\n".join(lines)
+
+
+def _macro_label(attrs: dict) -> str:
+    key = str(attrs.get("extensionKey") or "macro")
+    details = _macro_param_text(attrs)
+    label = f"{key}: {details}" if details else key
+    return _escape(label) or "macro"
+
+
+def _macro_param_text(attrs: dict) -> str:
+    parameters = attrs.get("parameters") if isinstance(attrs.get("parameters"), dict) else {}
+    macro_params = parameters.get("macroParams") if isinstance(parameters, dict) else None
+    if not isinstance(macro_params, dict):
+        return ""
+    values: list[str] = []
+    for key in sorted(macro_params, key=str):
+        item = macro_params[key]
+        value = item.get("value") if isinstance(item, dict) else item
+        if value is None or value == "":
+            continue
+        values.append(str(value))
+    return ", ".join(values)
+
+
+def _collect_headings(node: object, found: list[tuple[int, str]]) -> None:
+    if not isinstance(node, dict):
+        return
+    if node.get("type") == "heading":
+        try:
+            level = int((node.get("attrs") or {}).get("level") or 1)
+        except (TypeError, ValueError):
+            level = 1
+        level = min(max(level, 1), 6)
+        text = " ".join(_plain_text(node).split())
+        if text:
+            found.append((level, _escape(text)))
+        return
+    for child in _children(node):
+        _collect_headings(child, found)
+
+
 def _quote(text: str) -> str:
     if not text:
         return ""
@@ -246,9 +350,11 @@ def _render_inline(node: dict) -> str:
     if kind == "emoji":
         attrs = node.get("attrs") or {}
         return str(attrs.get("text") or attrs.get("shortName") or "")
-    if kind == "inlineCard":
+    if kind in ("inlineCard", "embedCard"):
         url = str((node.get("attrs") or {}).get("url") or "")
         return _link(url, url) if url else ""
+    if kind in ("mediaInline", "inlineExtension"):
+        return _render(node).replace("\n", " ").strip()
     if kind == "status":
         label = str((node.get("attrs") or {}).get("text") or "")
         return f"[{_escape(label)}]" if label else ""
@@ -332,9 +438,18 @@ RENDERERS = {
     "orderedList": _list,
     "table": _table,
     "media": _media,
+    "mediaInline": _media,
     "mediaSingle": _doc,
     "mediaGroup": _doc,
     "expand": _expand,
     "nestedExpand": _expand,
     "blockCard": _block_card,
+    "embedCard": _block_card,
+    "taskList": _task_list,
+    "decisionList": _decision_list,
+    "layoutSection": _doc,
+    "layoutColumn": _doc,
+    "extension": _extension,
+    "bodiedExtension": _extension,
+    "inlineExtension": _extension,
 }
