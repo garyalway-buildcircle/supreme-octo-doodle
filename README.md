@@ -58,3 +58,16 @@ Rewrites links in the exported markdown so they point at local files when those 
 ```bash
 make links
 ```
+
+## Git
+
+Writes one markdown file per GitHub repository: URL, default branch, commit, commit date, subject, README, languages, top-level layout, project files, and links to C4 container diagrams for Terraform and AWS CDK. Language counts and the layout skip dependency directories such as `node_modules`, `.terraform`, and `cdk.out`.
+
+A read-only personal access token is enough for a private repository. Public repositories need no token. Create a token with Contents read at <https://github.com/settings/personal-access-tokens>, then add `GIT_TOKEN` to `.env`. A `$` in a token must be written as `$$` because Make reads `.env`.
+
+```bash
+make git URL=https://github.com/org/name
+make git REPOS=repos.txt
+```
+
+`URL` is one repository. `REPOS` is a text file with one repository URL per line. Blank lines and lines starting with `#` are ignored. Pass one of them, not both. `https://github.com/org/name` and `git@github.com:org/name.git` are accepted. Other hosts are not. Each repository is written to `out/git/org-name.md`. Each C4 diagram is a separate raw Mermaid file, `out/git/org-name/terraform-<root>.mmd` or `out/git/org-name/cdk-<app>.mmd`, and the summary links to it. The clone is shallow, of the default branch, and is removed after the file is written.

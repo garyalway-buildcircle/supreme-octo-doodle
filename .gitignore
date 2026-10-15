@@ -1,5 +1,6 @@
 .env
 out/
+repos.txt
 __pycache__/
 *.pyc
 .venv/
