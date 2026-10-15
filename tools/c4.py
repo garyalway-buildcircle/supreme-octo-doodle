@@ -106,29 +106,6 @@ _TF: dict[str, tuple[str, str]] = {
 }
 
 _CDK: dict[tuple[str, str], tuple[str, str]] = {
-    ("", "ApplicationLoadBalancedFargateService"): ("container", "Amazon ECS"),
-    ("", "ApplicationLoadBalancer"): ("container", "Elastic Load Balancing"),
-    ("", "Bucket"): ("container", "Amazon S3"),
-    ("", "DatabaseCluster"): ("db", "Amazon Aurora"),
-    ("", "DatabaseInstance"): ("db", "Amazon RDS"),
-    ("", "Distribution"): ("container", "Amazon CloudFront"),
-    ("", "DockerImageFunction"): ("container", "AWS Lambda"),
-    ("", "Ec2Service"): ("container", "Amazon ECS"),
-    ("", "FargateService"): ("container", "Amazon ECS"),
-    ("", "FileSystem"): ("container", "Amazon EFS"),
-    ("", "HostedZone"): ("container", "Amazon Route 53"),
-    ("", "HttpApi"): ("container", "Amazon API Gateway"),
-    ("", "LambdaRestApi"): ("container", "Amazon API Gateway"),
-    ("", "NetworkLoadBalancer"): ("container", "Elastic Load Balancing"),
-    ("", "NodejsFunction"): ("container", "AWS Lambda"),
-    ("", "PythonFunction"): ("container", "AWS Lambda"),
-    ("", "Queue"): ("queue", "Amazon SQS"),
-    ("", "RestApi"): ("container", "Amazon API Gateway"),
-    ("", "ServerlessCluster"): ("db", "Amazon Aurora"),
-    ("", "StateMachine"): ("container", "AWS Step Functions"),
-    ("", "Table"): ("db", "Amazon DynamoDB"),
-    ("", "UserPool"): ("container", "Amazon Cognito"),
-    ("", "Vpc"): ("container", "Amazon VPC"),
     ("apigateway", "LambdaRestApi"): ("container", "Amazon API Gateway"),
     ("apigateway", "RestApi"): ("container", "Amazon API Gateway"),
     ("apigatewayv2", "HttpApi"): ("container", "Amazon API Gateway"),
@@ -528,20 +505,19 @@ def cdk_diagrams(repo: Path) -> list[Diagram]:
         return []
     diagrams: list[Diagram] = []
     for app in _cdk_apps(repo):
-        nodes: list[_Node] = []
-        edges: list[_Edge] = []
-        files: list[Path] = []
+        loaded: list[tuple[Path, str]] = []
         for path in _cdk_sources(app):
             text = _read_text(path, _FILE_LIMIT)
-            if text is None:
-                continue
-            files.append(path)
-            file_nodes, file_edges = _cdk_file(path, text)
-            nodes.extend(file_nodes)
-            edges.extend(file_edges)
+            if text is not None:
+                loaded.append((path, text))
+        sources = {path.resolve() for path, _text in loaded}
+        units = [_cdk_file(path, text, sources) for path, text in loaded]
+        nodes = [node for unit in units for node in unit.nodes]
         detail = _cdk_app_command(app / "cdk.json")
-        rel_files = sorted({_rel(repo, path) for path in files})
-        diagrams.append(_to_diagram(_title(repo, app), rel_files, [], nodes, edges, detail))
+        rel_files = sorted({_rel(repo, path) for path, _text in loaded})
+        diagrams.append(
+            _to_diagram(_title(repo, app), rel_files, [], nodes, _cdk_edges(units), detail)
+        )
     diagrams.sort(key=lambda diagram: diagram.title)
     return diagrams
 
@@ -971,20 +947,36 @@ def _is_cdk_source(app: Path, path: Path) -> bool:
     return name.endswith((".py", ".ts", ".tsx"))
 
 
-def _cdk_file(path: Path, text: str) -> tuple[list[_Node], list[_Edge]]:
+@dataclass
+class _CdkUnit:
+    path: Path
+    nodes: list[_Node]
+    variables: dict[str, str]
+    exports: dict[str, str]
+    properties: dict[str, str]
+    calls: list[tuple[str, str]]
+    value_imports: dict[str, tuple[Path, str]]
+    star_imports: list[Path]
+    masked: str
+
+
+def _cdk_file(path: Path, text: str, sources: set[Path]) -> _CdkUnit:
     python = path.suffix == ".py"
     masked = _mask_code(text, python)
+    classes, namespaces, value_imports, star_imports = _cdk_imports(path, text, sources)
     nodes: list[_Node] = []
     variables: dict[str, str] = {}
+    exports: dict[str, str] = {}
+    properties: dict[str, str] = {}
     calls: list[tuple[str, str]] = []
     for match in _CALL.finditer(masked):
-        looked = _lookup_cdk(match.group("chain"))
+        looked = _lookup_cdk(match.group("chain"), classes, namespaces)
         if looked is None:
             continue
         open_paren = match.end() - 1
         if open_paren >= len(text) or text[open_paren] != "(":
             continue
-        args, _end = _split_args(text, open_paren, python)
+        args, end = _split_args(text, open_paren, python)
         prefix, class_name, kind, technology = looked
         construct_id = _string_literal(args[1]) if len(args) > 1 else ""
         var = match.group("var") or ""
@@ -1002,36 +994,351 @@ def _cdk_file(path: Path, text: str) -> tuple[list[_Node], list[_Edge]]:
         )
         if var and var not in {"self", "this"}:
             variables[var] = key
-        calls.append((key, " ".join(args)))
+            kind_name = _binding_kind(_line_prefix(text, match.start()), python)
+            if kind_name == "property":
+                properties[var] = key
+            elif kind_name == "export":
+                exports[var] = key
+        if end > open_paren:
+            calls.append((key, masked[open_paren + 1 : end - 1]))
+    if not python:
+        for original, alias in _export_aliases(_blank_comments(text, python)):
+            exported = variables.get(original)
+            if exported:
+                exports[alias] = exported
+    return _CdkUnit(
+        path=path.resolve(),
+        nodes=nodes,
+        variables=variables,
+        exports=exports,
+        properties=properties,
+        calls=calls,
+        value_imports=value_imports,
+        star_imports=star_imports,
+        masked=masked,
+    )
+
+
+def _cdk_edges(units: list[_CdkUnit]) -> list[_Edge]:
+    by_path = {unit.path: unit for unit in units}
+    properties: dict[str, list[str]] = {}
+    for unit in units:
+        for name, key in unit.properties.items():
+            properties.setdefault(name, []).append(key)
+    unique_props = {name: keys[0] for name, keys in properties.items() if len(keys) == 1}
     edges: list[_Edge] = []
-    for key, args_text in calls:
-        for var, other in variables.items():
-            if other == key:
+    seen: set[tuple[str, str]] = set()
+
+    def add(src: str, dst: str) -> None:
+        if src == dst or (src, dst) in seen:
+            return
+        seen.add((src, dst))
+        edges.append(_Edge(src, dst, "References"))
+
+    for unit in units:
+        scope: dict[str, str] = {}
+        for src in unit.star_imports:
+            other = by_path.get(src)
+            if other is None:
                 continue
-            if re.search(rf"\b{re.escape(var)}\b", args_text):
-                edges.append(_Edge(key, other, "References"))
-    for var, key in variables.items():
-        for other, other_key in variables.items():
-            if var == other:
+            for name, key in other.exports.items():
+                scope.setdefault(name, key)
+        for local, (src, remote) in unit.value_imports.items():
+            other = by_path.get(src)
+            if other is None:
                 continue
-            pattern = (
-                rf"\b{re.escape(var)}\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\s*\("
-                rf"[^)]*\b{re.escape(other)}\b"
-            )
-            if re.search(pattern, masked):
-                edges.append(_Edge(key, other_key, "References"))
-    return nodes, edges
+            key = other.exports.get(remote)
+            if key:
+                scope[local] = key
+        scope.update(unit.variables)
+        for key, masked_args in unit.calls:
+            for name, other in scope.items():
+                if other != key and re.search(rf"\b{re.escape(name)}\b", masked_args):
+                    add(key, other)
+            for name, other in unique_props.items():
+                if other != key and re.search(rf"\.{re.escape(name)}\b", masked_args):
+                    add(key, other)
+        for name, key in scope.items():
+            for other_name, other in scope.items():
+                if name == other_name:
+                    continue
+                pattern = (
+                    rf"\b{re.escape(name)}\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\s*\("
+                    rf"[^)]*\b{re.escape(other_name)}\b"
+                )
+                if re.search(pattern, unit.masked):
+                    add(key, other)
+    return edges
 
 
-def _lookup_cdk(chain: str) -> tuple[str, str, str, str] | None:
+def _lookup_cdk(
+    chain: str,
+    classes: dict[str, tuple[str, str]],
+    namespaces: dict[str, str],
+) -> tuple[str, str, str, str] | None:
     parts = chain.split(".")
     class_name = parts[-1]
     prefix = parts[-2] if len(parts) > 1 else ""
-    found = _CDK.get((prefix, class_name))
-    if found is None:
+    if prefix:
+        found = _CDK.get((prefix, class_name))
+        if found is None and prefix in namespaces:
+            return _lookup_service_class(namespaces[prefix], class_name)
+        if found is None:
+            return None
+        kind, technology = found
+        return prefix, class_name, kind, technology
+    binding = classes.get(class_name)
+    if binding is None:
         return None
-    kind, technology = found
-    return prefix, class_name, kind, technology
+    service, imported = binding
+    return _lookup_service_class(service, imported)
+
+
+def _lookup_service_class(service: str, class_name: str) -> tuple[str, str, str, str] | None:
+    for prefix in (service, f"aws_{service}", f"{service}_"):
+        found = _CDK.get((prefix, class_name))
+        if found is not None:
+            kind, technology = found
+            return prefix, class_name, kind, technology
+    return None
+
+
+def _cdk_imports(
+    path: Path,
+    text: str,
+    sources: set[Path],
+) -> tuple[dict[str, tuple[str, str]], dict[str, str], dict[str, tuple[Path, str]], list[Path]]:
+    python = path.suffix == ".py"
+    visible = _blank_comments(text, python)
+    classes: dict[str, tuple[str, str]] = {}
+    namespaces: dict[str, str] = {}
+    values: dict[str, tuple[Path, str]] = {}
+    stars: list[Path] = []
+    if python:
+        _python_imports(path, visible, sources, classes, namespaces, values, stars)
+    else:
+        _typescript_imports(path, visible, sources, classes, namespaces, values, stars)
+    return classes, namespaces, values, stars
+
+
+def _typescript_imports(
+    path: Path,
+    text: str,
+    sources: set[Path],
+    classes: dict[str, tuple[str, str]],
+    namespaces: dict[str, str],
+    values: dict[str, tuple[Path, str]],
+    stars: list[Path],
+) -> None:
+    named = re.compile(
+        r"""import\s+(?:type\s+)?\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]"""
+    )
+    namespace = re.compile(
+        r"""import\s+\*\s+as\s+([A-Za-z_][A-Za-z0-9_]*)\s+from\s+['"]([^'"]+)['"]"""
+    )
+    for match in namespace.finditer(text):
+        service = _service_from_module(match.group(2))
+        if service:
+            namespaces[match.group(1)] = service
+    for match in named.finditer(text):
+        module = match.group(2)
+        service = _service_from_module(module)
+        resolved = None if service else _resolve_ts_module(path, module, sources)
+        pairs, _star = _name_pairs(match.group(1))
+        for original, alias in pairs:
+            if service:
+                classes[alias] = (service, original)
+            elif resolved is not None:
+                values[alias] = (resolved, original)
+
+
+def _python_imports(
+    path: Path,
+    text: str,
+    sources: set[Path],
+    classes: dict[str, tuple[str, str]],
+    namespaces: dict[str, str],
+    values: dict[str, tuple[Path, str]],
+    stars: list[Path],
+) -> None:
+    from_import = re.compile(r"from\s+([.\w]+)\s+import\s+(?:\(([^)]*)\)|([^\n]+))")
+    module_alias = re.compile(r"(?m)^import\s+([\w.]+)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)\s*$")
+    for match in module_alias.finditer(text):
+        service = _service_from_module(match.group(1))
+        if service:
+            namespaces[match.group(2)] = service
+    for match in from_import.finditer(text):
+        module = match.group(1)
+        spec = match.group(2) if match.group(2) is not None else match.group(3)
+        pairs, star = _name_pairs(spec or "", allow_star=True)
+        service = _service_from_module(module)
+        if service and star:
+            _import_service_star(service, classes)
+        if service:
+            for original, alias in pairs:
+                classes[alias] = (service, original)
+            continue
+        value_pairs: list[tuple[str, str]] = []
+        for original, alias in pairs:
+            imported = _service_from_module(f"{module}.{original}") or _service_from_module(original)
+            if imported:
+                namespaces[alias] = imported
+            else:
+                value_pairs.append((original, alias))
+        if star or value_pairs:
+            resolved = _resolve_py_module(path, module, sources)
+            if resolved is None:
+                continue
+            if star:
+                stars.append(resolved)
+            for original, alias in value_pairs:
+                values[alias] = (resolved, original)
+
+
+def _import_service_star(service: str, classes: dict[str, tuple[str, str]]) -> None:
+    prefixes = {service, f"aws_{service}", f"{service}_"}
+    for prefix, class_name in _CDK:
+        if prefix in prefixes:
+            classes.setdefault(class_name, (service, class_name))
+
+
+def _service_from_module(module: str) -> str | None:
+    tail = module.strip().replace("-", "_").split("/")[-1].split(".")[-1]
+    if tail.startswith("aws_"):
+        short = tail[4:]
+    else:
+        short = tail
+    prefixes = {prefix for prefix, _class_name in _CDK if prefix}
+    if short in prefixes or f"aws_{short}" in prefixes or f"{short}_" in prefixes:
+        return short
+    return None
+
+
+def _name_pairs(spec: str, allow_star: bool = False) -> tuple[list[tuple[str, str]], bool]:
+    pairs: list[tuple[str, str]] = []
+    star = False
+    for part in spec.split(","):
+        part = " ".join(part.split())
+        if not part:
+            continue
+        if part == "*":
+            star = allow_star
+            continue
+        match = re.fullmatch(
+            r"([A-Za-z_][A-Za-z0-9_]*)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?",
+            part,
+        )
+        if match:
+            pairs.append((match.group(1), match.group(2) or match.group(1)))
+    return pairs, star
+
+
+def _export_aliases(text: str) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for match in re.finditer(r"export\s+\{([^}]+)\}", text):
+        found, _star = _name_pairs(match.group(1))
+        pairs.extend(found)
+    return pairs
+
+
+def _resolve_ts_module(importer: Path, spec: str, sources: set[Path]) -> Path | None:
+    if not spec.startswith("."):
+        return None
+    return _match_source(importer.parent / spec, sources)
+
+
+def _resolve_py_module(importer: Path, module: str, sources: set[Path]) -> Path | None:
+    if module.startswith("."):
+        dots = 0
+        rest = module
+        while rest.startswith("."):
+            dots += 1
+            rest = rest[1:]
+        base = importer.parent
+        for _step in range(dots - 1):
+            base = base.parent
+        parts = [part for part in rest.split(".") if part]
+        candidate = base.joinpath(*parts) if parts else base
+    else:
+        candidate = importer.parent.joinpath(*module.split("."))
+    return _match_source(candidate, sources)
+
+
+def _match_source(candidate: Path, sources: set[Path]) -> Path | None:
+    options = [candidate]
+    if candidate.suffix == ".js":
+        options.append(candidate.with_suffix(".ts"))
+        options.append(candidate.with_suffix(".tsx"))
+    elif candidate.suffix == "":
+        options.extend(
+            [
+                candidate.with_suffix(".ts"),
+                candidate.with_suffix(".tsx"),
+                candidate.with_suffix(".py"),
+                candidate / "index.ts",
+                candidate / "index.tsx",
+                candidate / "__init__.py",
+            ]
+        )
+    for option in options:
+        resolved = option.resolve()
+        if resolved in sources:
+            return resolved
+    return None
+
+
+def _line_prefix(text: str, index: int) -> str:
+    return text[text.rfind("\n", 0, index) + 1 : index]
+
+
+def _binding_kind(prefix: str, python: bool) -> str:
+    if re.search(r"this\s*\.\s*$", prefix):
+        return "property"
+    if re.search(r"\b(?:public|private|protected|readonly)\b", prefix) and not re.search(
+        r"\b(?:const|let|var)\b",
+        prefix,
+    ):
+        return "property"
+    if not python and re.search(r"\bexport\s+(?:declare\s+)?(?:const|let|var)\s+$", prefix):
+        return "export"
+    if python and prefix.strip() == "":
+        return "export"
+    return "local"
+
+
+def _blank_comments(text: str, python: bool) -> str:
+    chars = list(text)
+    i = 0
+    n = len(chars)
+    while i < n:
+        if chars[i] in "'\"" or (not python and chars[i] == "`") or text.startswith(("'''", '"""'), i):
+            i = _skip_js_string(text, i)
+            continue
+        if python and chars[i] == "#":
+            while i < n and chars[i] != "\n":
+                chars[i] = " "
+                i += 1
+            continue
+        if not python and i + 1 < n and chars[i] == "/" and chars[i + 1] == "/":
+            while i < n and chars[i] != "\n":
+                chars[i] = " "
+                i += 1
+            continue
+        if not python and i + 1 < n and chars[i] == "/" and chars[i + 1] == "*":
+            chars[i] = " "
+            chars[i + 1] = " "
+            i += 2
+            while i + 1 < n and not (chars[i] == "*" and chars[i + 1] == "/"):
+                if chars[i] != "\n":
+                    chars[i] = " "
+                i += 1
+            if i + 1 < n:
+                chars[i] = " "
+                chars[i + 1] = " "
+                i += 2
+            continue
+        i += 1
+    return "".join(chars)
 
 
 def _split_args(text: str, open_paren: int, python: bool) -> tuple[list[str], int]:

@@ -250,3 +250,73 @@ bucket.grantRead(fn);
         self.assertNotIn("Hidden", diagram.mermaid)
         self.assertNotIn("ShouldNotAppear", diagram.mermaid)
         self.assertNotIn("cdk.json", diagram.mermaid)
+
+    def test_bare_classes_need_a_cdk_import_and_strings_are_not_edges(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write(root, "cdk.json", '{"app": "npx ts-node bin/app.ts"}\n')
+            _write(
+                root,
+                "bin/app.ts",
+                """\
+import { Bucket } from "aws-cdk-lib/aws-s3";
+const uploads = new Bucket(this, "Uploads");
+const rows = new Table(this, "Rows");
+const fn = new lambda.Function(this, "Api", {
+  description: "not the uploads",
+});
+""",
+            )
+            mermaid = cdk_diagrams(root)[0].mermaid
+        self.assertIn('Container(Uploads, "Uploads", "Amazon S3", "s3.Bucket")', mermaid)
+        self.assertNotIn("Rows", mermaid)
+        self.assertNotIn("DynamoDB", mermaid)
+        self.assertNotIn("Rel(", mermaid)
+
+    def test_imported_constructs_are_edges_across_files(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write(root, "cdk.json", '{"app": "npx ts-node bin/app.ts"}\n')
+            _write(
+                root,
+                "storage.ts",
+                """\
+export class Storage {
+  constructor() {
+    this.bucket = new s3.Bucket(this, "Uploads");
+  }
+}
+export const queue = new sqs.Queue(this, "Jobs");
+""",
+            )
+            _write(
+                root,
+                "bin/app.ts",
+                """\
+import { queue } from "../storage";
+const fn = new lambda.Function(this, "Api", {
+  environment: {
+    QUEUE: queue.queueUrl,
+    BUCKET: storage.bucket.bucketName,
+  },
+});
+""",
+            )
+            _write(root, "py/cdk.json", '{"app": "python app.py"}\n')
+            _write(root, "py/storage.py", 'bucket = s3.Bucket(self, "Uploads")\n')
+            _write(
+                root,
+                "py/app.py",
+                """\
+from storage import bucket
+fn = aws_lambda.Function(self, "Api", environment={"B": bucket.bucket_name})
+""",
+            )
+
+            diagrams = {diagram.title: diagram for diagram in cdk_diagrams(root)}
+
+        typescript = diagrams["."].mermaid
+        self.assertIn('Rel(Api, Jobs, "References")', typescript)
+        self.assertIn('Rel(Api, Uploads, "References")', typescript)
+        python = diagrams["py"].mermaid
+        self.assertIn('Rel(Api, Uploads, "References")', python)
