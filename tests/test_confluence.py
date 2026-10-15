@@ -367,6 +367,7 @@ class ExtractTests(unittest.TestCase):
                 }
             if path.endswith("/content/search"):
                 cql = query.get("cql", [""])[0]
+                self.assertNotIn("status", cql)
                 if "container = 1" in cql:
                     return 200, {
                         "results": [
@@ -717,7 +718,8 @@ class ClientTests(unittest.TestCase):
 
     def test_reply_cycle_stops(self):
         def transport(url: str) -> tuple[int, dict | None]:
-            self.assertIn("/rest/api/content/search", url)
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+            self.assertNotIn("status", query["cql"][0])
             return 200, {
                 "results": [
                     _search_comment("10", "Root", "acc-ada", "Ada", "2021-01-17T12:34:00.000Z"),
@@ -729,6 +731,13 @@ class ClientTests(unittest.TestCase):
                         "2021-01-18T09:00:00.000Z",
                         parent="10",
                     ),
+                    {
+                        "id": "13",
+                        "status": "trashed",
+                        "type": "comment",
+                        "extensions": {"location": "footer"},
+                        "body": {"atlas_doc_format": {"value": _adf("Gone")}},
+                    },
                     {
                         "id": "12",
                         "type": "comment",

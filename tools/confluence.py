@@ -85,10 +85,7 @@ class ConfluenceClient:
         return self._paginate(url, f"descendants of {page_id}")
 
     def get_page_comments(self, page_id: str) -> tuple[list[dict], list[dict]]:
-        cql = (
-            f"container = {page_id} AND type = comment AND status = current "
-            "ORDER BY created ASC"
-        )
+        cql = f"container = {page_id} AND type = comment ORDER BY created ASC"
         query = urllib.parse.urlencode(
             {
                 "cql": cql,
@@ -919,7 +916,8 @@ def _comment_threads(flat: list[dict]) -> tuple[list[dict], list[dict]]:
     order: list[str] = []
     for raw in flat:
         comment_id = str(raw.get("id") or "")
-        if not comment_id or comment_id in mapped:
+        status = str(raw.get("status") or "current").lower()
+        if not comment_id or comment_id in mapped or status != "current":
             continue
         mapped[comment_id] = _map_comment(raw)
         order.append(comment_id)
